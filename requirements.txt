@@ -1,0 +1,15 @@
+# 필수 표준 라이브러리는 제외하고, 코드에서 사용될 수 있는 주요 외부 패키지 위주로 명시합니다.
+# gzip
+# json
+# pathlib
+# PDF/PPTX 처리 및 OCR을 위해 아래 패키지 추가
+pypdf2>=3.0.0
+pymupdf>=1.20.0
+pytesseract>=0.3.10
+pdfplumber>=0.7.0
+camelot-py>=0.10.1
+opencv-python>=4.6.0
+numpy>=1.22.0
+python-pptx>=0.6.21
+# 기타 크롤링 및 데이터 처리에 필요할 수 있는 패키지 예시
+requests>=2.28.0
