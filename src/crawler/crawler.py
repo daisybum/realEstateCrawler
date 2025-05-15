@@ -34,13 +34,19 @@ from src.storage.file_processor import FileProcessor, DownloadDetector
 from src.storage.storage import JsonlStorage, CheckpointManager
 
 
-# Patterns of words that indicate non-downloadable or irrelevant resources
-# Centralised so that filtering rules stay consistent across the crawler.
+# 상수 정의
+# 다운로드 제외 패턴: 다운로드 링크로 감지하지 않을 패턴
 EXCLUDE_PATTERNS = [
     "이미지", "사진", "갤러리", "썸네일", "미리보기", "광고", "배너", "로고",
     "certificate", "원격평생교육원", "인증서", "자격증", "수료증", "교육이수증",
     "학위증", "졸업증명서", "증명서", "인증", "logo", "banner", "thumbnail"
 ]
+
+# 지원하는 파일 확장자
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".hwp"]
+
+# 다운로드 관련 키워드
+DOWNLOAD_KEYWORDS = ["첨부", "자료", "파일", "다운로드", "다운", "다운받기", "자료실", "문서"]
 
 
 class CrawlerError(Exception):
@@ -405,8 +411,7 @@ class Crawler:
             
             # 패턴 2: 파일 확장자가 포함된 링크 찾기
             if not download_links:
-                file_extensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.hwp']
-                for ext in file_extensions:
+                for ext in SUPPORTED_EXTENSIONS:
                     # 확장자가 포함된 href 속성을 가진 링크 찾기
                     ext_links = soup.find_all('a', href=lambda href: href and ext.lower() in href.lower())
                     for link in ext_links:
@@ -425,8 +430,7 @@ class Crawler:
             
             # 패턴 3: '첨부', '자료', '파일' 등의 키워드가 포함된 링크 찾기
             if not download_links:
-                download_keywords = ['첨부', '자료', '파일', '다운로드', '다운', '다운받기', '자료실', '문서']
-                for keyword in download_keywords:
+                for keyword in DOWNLOAD_KEYWORDS:
                     # 키워드가 포함된 텍스트를 가진 링크 찾기
                     keyword_links = soup.find_all('a', string=lambda text: text and keyword in text)
                     for link in keyword_links:
@@ -509,8 +513,6 @@ class Crawler:
         except Exception as e:
             logging.error(f"Error detecting downloadable files: {e}")
             return download_links
-        
-        return download_links
     
     def _download_and_parse_file(self, url: str, filename: str) -> Dict[str, Any]:
         """
@@ -854,45 +856,62 @@ class Crawler:
                     # Remove UUID pattern
                     clean_text = uuid_pattern.sub('', link['text']).strip()
                     if clean_text:
-                        # Check if it already has an extension
-                        if any(clean_text.lower().endswith(ext) for ext in [".pdf", ".docx", ".pptx", ".xlsx", ".hwp"]):
+                        # 파일 확장자가 이미 있는지 확인
+                        if any(clean_text.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                             filename = clean_text
                         else:
-                            # Add extension based on URL or link text
-                            if 'pdf' in download_url.lower() or 'pdf' in link['text'].lower():
+                            # URL 또는 링크 텍스트에서 파일 형식 추측
+                            ext_mapping = {
+                                'pdf': '.pdf',
+                                'pptx': '.pptx', 'ppt': '.pptx',
+                                'docx': '.docx', 'doc': '.docx',
+                                'xlsx': '.xlsx', 'xls': '.xlsx', 'excel': '.xlsx',
+                                'hwp': '.hwp'
+                            }
+                            
+                            # 링크 텍스트와 URL에서 파일 형식 키워드 찾기
+                            text_to_check = (download_url + ' ' + link.get('text', '')).lower()
+                            
+                            for keyword, extension in ext_mapping.items():
+                                if keyword in text_to_check:
+                                    filename = f"{clean_text}{extension}"
+                                    break
+                            
+                            # 기본값으로 PDF 사용
+                            if not filename:
                                 filename = f"{clean_text}.pdf"
-                            elif 'pptx' in download_url.lower() or 'ppt' in link['text'].lower():
-                                filename = f"{clean_text}.pptx"
-                            elif 'docx' in download_url.lower() or 'doc' in link['text'].lower():
-                                filename = f"{clean_text}.docx"
-                            elif 'xlsx' in download_url.lower() or 'excel' in link['text'].lower():
-                                filename = f"{clean_text}.xlsx"
-                            elif 'hwp' in download_url.lower() or 'hwp' in link['text'].lower():
-                                filename = f"{clean_text}.hwp"
                 
                 # 2. Try to extract from URL
                 if not filename and download_url:
                     url_parts = download_url.split('/')
                     if url_parts and url_parts[-1]:
-                        # Check if it has an extension
-                        if any(url_parts[-1].lower().endswith(ext) for ext in [".pdf", ".docx", ".pptx", ".xlsx", ".hwp"]):
+                        # 파일 확장자 확인
+                        if any(url_parts[-1].lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                             filename = url_parts[-1]
                 
-                # 3. Infer from page content
+                # 3. 페이지 내용에서 파일 형식 추론
                 if not filename and link.get('text'):
                     page_content = getattr(download_info, 'page_content', '').lower()
-                    if '.pdf' in page_content:
-                        filename = f"{link['text']}.pdf"
-                    elif '.pptx' in page_content or '.ppt' in page_content:
-                        filename = f"{link['text']}.pptx"
-                    elif '.docx' in page_content or '.doc' in page_content:
-                        filename = f"{link['text']}.docx"
-                    elif '.hwp' in page_content:
-                        filename = f"{link['text']}.hwp"
-                    elif '.xlsx' in page_content:
-                        filename = f"{link['text']}.xlsx"
-                    else:
-                        # Default to PDF for generic download buttons
+                    
+                    # 파일 형식 추론을 위한 매핑
+                    ext_mapping = {
+                        '.pdf': '.pdf',
+                        '.pptx': '.pptx', '.ppt': '.pptx',
+                        '.docx': '.docx', '.doc': '.docx',
+                        '.xlsx': '.xlsx', '.xls': '.xlsx',
+                        '.hwp': '.hwp'
+                    }
+                    
+                    # 페이지 내용에서 파일 형식 키워드 찾기
+                    found_ext = False
+                    for keyword, extension in ext_mapping.items():
+                        if keyword in page_content:
+                            filename = f"{link['text']}{extension}"
+                            found_ext = True
+                            break
+                    
+                    # 기본값으로 PDF 사용
+                    if not found_ext:
                         filename = f"{link['text']}.pdf"
                 
                 # 4. Use default if still no filename
