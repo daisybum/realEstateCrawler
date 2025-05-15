@@ -1,0 +1,72 @@
+[General]
+# Output directory for crawled data
+output_dir = output
+# JSONL output file name
+jsonl_file = weolbu_posts.jsonl
+# Checkpoint file name
+checkpoint_file = checkpoint.json
+# Download directory for attachments
+download_dir = downloads
+
+[URLs]
+# Base URL for the website
+base_url = https://weolbu.com
+# Community path
+community_path = /community
+# API path for posts
+api_path = /api/v1/community/posts
+# Login path
+login_path = /api/v1/auth/login
+
+[Community]
+# Tab ID for the community section
+tab = 100143
+# Subtab ID for the specific section
+subtab = 5
+
+[Credentials]
+# Login credentials (recommended to use environment variables instead)
+# login_id = your_username
+# login_pw = your_password
+
+[Browser]
+# User agent string
+user_agent = Mozilla/5.0 (WeolbuCrawler/0.5)
+# Run browser in headless mode
+browser_headless = true
+# Disable automation detection
+disable_automation = true
+# Disable sandbox (for containerized environments)
+no_sandbox = true
+# Disable shared memory
+disable_shm = true
+
+[Timeouts]
+# Request timeout in seconds
+request_timeout = 20
+# Wait time after login in seconds
+wait_after_login = 5
+# Wait time for page load in seconds
+wait_page_load = 3
+# Wait time between pages in seconds
+wait_between_pages = 1
+
+[RateLimiting]
+# Enable rate limiting
+rate_limit_enabled = true
+# Maximum requests per period
+rate_limit_requests = 5
+# Rate limit period in seconds
+rate_limit_period = 10
+
+[Retry]
+# Maximum number of retries
+max_retries = 3
+# Delay between retries in seconds
+retry_delay = 5
+
+[FileTypes]
+# Supported file types (comma-separated)
+supported_file_types = .pdf, .pptx, .docx, .hwp, .ppt, .doc, .xlsx, .xls
+# Excluded file types (comma-separated)
+excluded_file_types = .jpg, .jpeg, .png, .gif, .svg
