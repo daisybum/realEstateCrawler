@@ -10,26 +10,102 @@
 ──────────────────────────────────────────────────────────────
 """
 
+import os
 import logging
+import argparse
+from pathlib import Path
 from src.config import Config
 from src.crawler.crawler import Crawler
 
 
-def main():
-    """Main entry point"""
-    # Configure logging
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Real Estate Crawler for Weolbu.com")
+    parser.add_argument(
+        "-c", "--config", 
+        help="Path to configuration file", 
+        default=None
+    )
+    parser.add_argument(
+        "-o", "--output", 
+        help="Output directory for crawled data", 
+        default=None
+    )
+    parser.add_argument(
+        "--headless", 
+        help="Run browser in headless mode", 
+        action="store_true"
+    )
+    parser.add_argument(
+        "--debug", 
+        help="Enable debug logging", 
+        action="store_true"
+    )
+    return parser.parse_args()
+
+
+def setup_logging(debug=False):
+    """Configure logging"""
+    log_level = logging.DEBUG if debug else logging.INFO
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        level=log_level,
+        format=log_format
     )
     
-    # Create and run crawler
-    crawler = Crawler()
-    crawler.crawl()
+    # Create a file handler for logging to a file
+    os.makedirs("logs", exist_ok=True)
+    file_handler = logging.FileHandler("logs/crawler.log")
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter(log_format))
     
-    # Print completion message
-    print(f"✅ 완료 → {Config.OUT_JSONL.resolve()}")
+    # Add the file handler to the root logger
+    logging.getLogger().addHandler(file_handler)
+
+
+def main():
+    """Main entry point"""
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Configure logging
+    setup_logging(args.debug)
+    
+    # Initialize configuration
+    Config.initialize(args.config)
+    config = Config.get_instance()
+    
+    # Override configuration with command line arguments
+    if args.output:
+        config._config_loader.set('output_dir', args.output)
+    
+    if args.headless:
+        config._config_loader.set('browser_headless', True)
+    
+    # Ensure directories exist
+    Config.ensure_directories()
+    
+    # Log configuration
+    logging.info(f"Starting crawler with output directory: {config.output_dir}")
+    logging.info(f"JSONL output file: {config.out_jsonl}")
+    logging.info(f"Checkpoint file: {config.checkpoint_file}")
+    
+    # Create and run crawler
+    try:
+        crawler = Crawler()
+        crawler.crawl()
+        
+        # Print completion message
+        print(f"✅ 완료 → {config.out_jsonl.resolve()}")
+    except Exception as e:
+        logging.error(f"Error during crawling: {e}", exc_info=True)
+        print(f"❌ 오류 발생: {e}")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    exit(exit_code)
