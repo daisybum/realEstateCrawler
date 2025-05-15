@@ -9,12 +9,17 @@ import logging
 import re
 from typing import List, Dict, Any
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
+from io import BytesIO
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 from src.models.models import FileContent, DownloadInfo
+from src.parser.document_parser import DocumentParser
+from src.parser.pdf_parser import PDFParser
+from src.parser.pptx_parser import PPTXParser
+from src.parser.docx_parser import DOCXParser
 
 
 class FileProcessor:
@@ -28,6 +33,75 @@ class FileProcessor:
             scraper: Cloudscraper instance for HTTP requests
         """
         self.scraper = scraper
+        
+        # Initialize document parsers
+        try:
+            # BytesIO for in-memory processing
+            self.BytesIO = BytesIO
+            
+            # Initialize document parsers
+            self.document_parser = DocumentParser()
+            self.pdf_parser = PDFParser()
+            self.pptx_parser = PPTXParser()
+            self.docx_parser = DOCXParser()
+            
+            self.imports_successful = True
+        except ImportError as e:
+            logging.error(f"Failed to import document processing libraries: {e}")
+            self.imports_successful = False
+            
+    def parse_file_bytes(self, file_obj, file_ext: str, filename: str = "", url: str = "") -> Dict[str, Any]:
+        """
+        Parse file bytes using appropriate document parser
+        
+        Args:
+            file_obj: BytesIO object containing file data
+            file_ext: File extension (e.g., '.pdf')
+            filename: Optional filename for reference
+            url: Optional URL for reference
+            
+        Returns:
+            Dictionary with parsed content
+        """
+        if not self.imports_successful:
+            return {
+                "content": f"파일 다운로드 링크: {url}\n파일명: {filename}",
+                "error": "Document processing libraries not available"
+            }
+        
+        try:
+            # 임시 파일을 생성하여 document_parser를 통해 처리
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as temp_file:
+                # BytesIO 객체의 내용을 임시 파일에 쓰기
+                file_obj.seek(0)  # 파일 포인터를 처음으로 이동
+                temp_file.write(file_obj.read())
+                temp_file_path = temp_file.name
+            
+            try:
+                # DocumentParser를 사용하여 파일 파싱
+                result = self.document_parser.parse_document(temp_file_path)
+                
+                # 파일 메타데이터 추가
+                result["filename"] = filename
+                result["url"] = url
+                result["file_type"] = file_ext[1:] if file_ext.startswith('.') else file_ext
+                
+                return result
+                
+            finally:
+                # 임시 파일 삭제
+                try:
+                    os.unlink(temp_file_path)
+                except Exception as e:
+                    logging.warning(f"Failed to delete temporary file {temp_file_path}: {e}")
+            
+        except Exception as e:
+            logging.error(f"Error parsing file bytes: {e}")
+            return {
+                "content": f"파일 처리 오류: {e}\n파일 다운로드 링크: {url}\n파일명: {filename}",
+                "error": str(e)
+            }
     
     def parse_file(self, url: str, pid: str, filename: str) -> List[FileContent]:
         """
@@ -43,101 +117,54 @@ class FileProcessor:
         """
         file_ext = os.path.splitext(filename)[1].lower()
         
-        # Map file extensions to handlers
-        handlers = {
-            ".pdf": self._parse_pdf,
-            ".pptx": self._parse_pptx,
-            ".ppt": self._parse_pptx,
-            ".docx": self._parse_docx,
-            ".doc": self._parse_docx,
-            ".hwp": self._parse_hwp
+        # Supported file extensions
+        supported_extensions = {
+            ".pdf", ".pptx", ".ppt", ".docx", ".doc", ".hwp"
         }
         
-        # Process file if handler exists
-        if file_ext in handlers:
+        # Process file if extension is supported
+        if file_ext in supported_extensions:
             try:
-                return [handlers[file_ext](url, filename)]
+                # Download file content
+                if not self.scraper:
+                    logging.error("Scraper not initialized")
+                    return []
+                    
+                response = self.scraper.get(url, stream=True)
+                response.raise_for_status()
+                
+                # Process file in-memory
+                file_bytes = response.content
+                file_obj = self.BytesIO(file_bytes)
+                
+                # Parse file using document parser
+                parsed_content = self.parse_file_bytes(file_obj, file_ext, filename, url)
+                
+                # Create FileContent object
+                file_content = FileContent(
+                    filename=filename,
+                    url=url,
+                    file_type=file_ext[1:] if file_ext.startswith('.') else file_ext,
+                    content=parsed_content.get("content", ""),
+                    metadata=parsed_content.get("metadata", {}),
+                    tables=parsed_content.get("tables", []),
+                    images=parsed_content.get("images", [])
+                )
+                
+                return [file_content]
             except Exception as e:
                 logging.error(f"파일 처리 오류 ({file_ext}): {e}")
         
         return []
     
-    def _parse_pdf(self, url: str, filename: str) -> FileContent:
-        """
-        Extract text from PDF file
-        
-        Args:
-            url: PDF URL
-            filename: PDF filename
-            
-        Returns:
-            FileContent object with PDF data
-        """
-        # In a real implementation, download and process PDF
-        # For now, just create a placeholder
-        return FileContent(
-            filename=filename,
-            url=url,
-            file_type="pdf",
-            content=f"PDF 파일 다운로드 링크: {url}\n파일명: {filename}"
-        )
+    # 불필요한 _parse_pdf 메서드 제거됨
     
-    def _parse_pptx(self, url: str, filename: str) -> FileContent:
-        """
-        Extract text from PowerPoint file
-        
-        Args:
-            url: PowerPoint URL
-            filename: PowerPoint filename
-            
-        Returns:
-            FileContent object with PowerPoint data
-        """
-        # In a real implementation, download and process PPTX
-        return FileContent(
-            filename=filename,
-            url=url,
-            file_type="pptx",
-            content=f"PowerPoint 파일 다운로드 링크: {url}\n파일명: {filename}"
-        )
+    # 불필요한 _process_image_ocr 메서드 제거됨
     
-    def _parse_docx(self, url: str, filename: str) -> FileContent:
-        """
-        Extract text from Word file
-        
-        Args:
-            url: Word URL
-            filename: Word filename
-            
-        Returns:
-            FileContent object with Word data
-        """
-        # In a real implementation, download and process DOCX
-        return FileContent(
-            filename=filename,
-            url=url,
-            file_type="docx",
-            content=f"Word 파일 다운로드 링크: {url}\n파일명: {filename}"
-        )
+    # 불필요한 parse_pdf_bytes 메서드 제거됨
     
-    def _parse_hwp(self, url: str, filename: str) -> FileContent:
-        """
-        Extract text from HWP file
-        
-        Args:
-            url: HWP URL
-            filename: HWP filename
-            
-        Returns:
-            FileContent object with HWP data
-        """
-        # In a real implementation, download and process HWP
-        return FileContent(
-            filename=filename,
-            url=url,
-            file_type="hwp",
-            content=f"HWP 파일 다운로드 링크: {url}\n파일명: {filename}"
-        )
+    # 불필요한 _parse_pptx 메서드 제거됨
+    
 
 
 class DownloadDetector:
