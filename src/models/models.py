@@ -85,6 +85,15 @@ class Post:
         """Convert to a list of records for storage"""
         records = []
         
+        # 다운로드 요약 정보 업데이트
+        if self.download_info and self.download_info.has_download:
+            # 실제 다운로드 링크 수를 기준으로 요약 정보 생성
+            link_count = len(self.download_info.download_links) if self.download_info.download_links else 0
+            formats = ", ".join(self.download_info.file_formats) if self.download_info.file_formats else "알 수 없음"
+            self.download_summary = f"[다운로드 파일: {formats}, {link_count}개 파일] "
+        else:
+            self.download_summary = "[다운로드 없음] "
+        
         # Basic post information
         post_info = {
             "post_id": self.post_id,
@@ -158,8 +167,29 @@ class Post:
     
     def update_download_summary(self) -> None:
         """Update download summary based on download info"""
-        if self.download_info and self.download_info.has_download and self.download_info.file_formats:
-            formats_str = ", ".join(self.download_info.file_formats)
-            self.download_summary = f"[다운로드 파일: {formats_str}] "
+        if self.download_info and self.download_info.has_download:
+            links_count = len(self.download_info.download_links) if self.download_info.download_links else 0
+            buttons_count = len(self.download_info.download_buttons) if self.download_info.download_buttons else 0
+            total_count = links_count + buttons_count
+            
+            if self.download_info.file_formats:
+                # Case 1: Download available with identified file formats
+                formats_str = ", ".join(self.download_info.file_formats)
+                if total_count > 0:
+                    self.download_summary = f"[다운로드 파일: {formats_str}, {total_count}개 파일] "
+                else:
+                    self.download_summary = f"[다운로드 파일: {formats_str}] "
+            else:
+                # Case 2: Download available but format couldn't be identified
+                if total_count > 0:
+                    self.download_summary = f"[다운로드 가능: {total_count}개 파일] "
+                else:
+                    # This case occurs when has_download is true but we couldn't determine formats or count
+                    self.download_summary = "[다운로드 감지됨] "
+                    
+                # Add a note in log for debugging purposes
+                import logging
+                logging.warning(f"[포스트 {self.post_id}] 다운로드 감지되었지만 파일 형식 불명함")
         else:
+            # Case 3: No download detected
             self.download_summary = "[다운로드 없음] "
