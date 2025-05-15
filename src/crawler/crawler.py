@@ -28,6 +28,15 @@ from src.storage.file_processor import FileProcessor, DownloadDetector
 from src.storage.storage import JsonlStorage, CheckpointManager
 
 
+# Patterns of words that indicate non-downloadable or irrelevant resources
+# Centralised so that filtering rules stay consistent across the crawler.
+EXCLUDE_PATTERNS = [
+    "이미지", "사진", "갤러리", "썸네일", "미리보기", "광고", "배너", "로고",
+    "certificate", "원격평생교육원", "인증서", "자격증", "수료증", "교육이수증",
+    "학위증", "졸업증명서", "증명서", "인증", "logo", "banner", "thumbnail"
+]
+
+
 class Crawler:
     """Main crawler class that orchestrates the crawling process"""
     
@@ -199,23 +208,208 @@ class Crawler:
         Returns:
             Updated Post object
         """
-        # Skip if no downloads
-        if not download_info.has_download or not download_info.download_links:
-            return post
+        # 불필요한 파일 필터링
+        if download_info.download_links:
+            # 제외할 파일 패턴
+            exclude_files = ["BC.pdf", "BC.docx", "BC.xlsx"]
+            # UUID 패턴 (예: 20b005cb-7b99-4143-9a4f-e0181f0af1e4.pptx)
+            uuid_pattern = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(pdf|pptx?|docx?|xlsx?|hwp)")
+            
+            # 필터링된 다운로드 링크만 유지
+            filtered_links = []
+            seen_urls = set()  # 중복 URL 체크용
+            
+            for link in download_info.download_links:
+                url = link.get("url", "")
+                filename = os.path.basename(url.split("?")[0])
+                
+                # 제외 파일 패턴에 해당하거나 UUID 패턴인 경우 건너뛰기
+                if any(exclude in url for exclude in exclude_files) or uuid_pattern.search(url):
+                    logging.info(f"[페이지 {post.post_id}] 불필요한 파일 제외: {url}")
+                    continue
+                    
+                # 중복 URL 제거
+                if url in seen_urls:
+                    continue
+                    
+                seen_urls.add(url)
+                filtered_links.append(link)
+            
+            # 필터링된 링크로 업데이트
+            download_info.download_links = filtered_links
+            
+            # 파일 형식 재계산
+            if filtered_links:
+                file_formats = set()
+                for link in filtered_links:
+                    url = link.get("url", "")
+                    ext = self.download_detector.extract_file_extension(url)
+                    if ext:
+                        file_formats.add(ext)
+                download_info.file_formats = list(file_formats)
+            else:
+                download_info.file_formats = []
+                download_info.has_download = False
+        # Check if has_download is True but we need to correct the file_formats
+        if download_info.has_download:
+            # Enhanced PDF indicators including more Korean terms
+            pdf_indicators = [
+                "pdf", "문서", "보고서", "첨부파일", "다운로드", "download", 
+                "리포트", "자료", "발표자료", "연구", "논문", "결과물", "레포트", 
+                "결과보고서", "연구보고서", "분석", "정보"
+            ]
+            
+            # URL patterns that strongly indicate PDF
+            pdf_url_patterns = [".pdf", "/pdf/", "pdf=", "type=pdf", "format=pdf", "document", "report"]
+            
+            # If file_formats contains xlsx but evidence suggests PDF, replace with PDF
+            if "xlsx" in download_info.file_formats:
+                # First check URLs for PDF indicators
+                for link in download_info.download_links:
+                    url = link.get("url", "").lower()
+                    # Check if any PDF URL pattern is in the URL
+                    if any(pattern in url for pattern in pdf_url_patterns):
+                        # Remove xlsx and add pdf if not already there
+                        if "pdf" not in download_info.file_formats:
+                            download_info.file_formats = ["pdf"]
+                            logging.info(f"[페이지 {post.post_id}] 파일 형식 수정: xlsx -> pdf (URL 패턴 기반)")
+                            break
+                
+                # Then check link text for PDF indicators if URL check didn't change format
+                if "xlsx" in download_info.file_formats:
+                    for link in download_info.download_links:
+                        link_text = link.get("text", "").lower()
+                        # Check if any PDF indicator is in the link text
+                        if any(indicator in link_text for indicator in pdf_indicators):
+                            # Remove xlsx and add pdf if not already there
+                            if "pdf" not in download_info.file_formats:
+                                download_info.file_formats = ["pdf"]
+                                logging.info(f"[페이지 {post.post_id}] 파일 형식 수정: xlsx -> pdf (링크 텍스트 기반)")
+                                break
+            
+            # Check all links for direct PDF indicators regardless of current format
+            for link in download_info.download_links:
+                url = link.get("url", "").lower()
+                # Strong PDF indicators in URL take precedence over any other format
+                if url.endswith(".pdf") or "/pdf/" in url:
+                    if "pdf" not in download_info.file_formats:
+                        download_info.file_formats = ["pdf"]
+                        logging.info(f"[페이지 {post.post_id}] 파일 형식 수정: URL 기반으로 PDF 감지")
+                        break
         
+        # Filter out non-downloadable links by unified rule set
+        download_info.download_links = [
+            link for link in download_info.download_links
+            if not any(pat in (link.get("url", "").lower() + link.get("text", "").lower()) for pat in EXCLUDE_PATTERNS)
+        ]
+        
+        # Re-check has_download based on filtered links
+        download_info.has_download = bool(download_info.download_links or download_info.download_buttons)
+        
+        # Ensure download_links is populated if has_download is True
+        if download_info.has_download:
+            # Initialize post.download_links if needed
+            if not hasattr(post, 'download_links') or post.download_links is None:
+                post.download_links = []
+                
+            # First handle existing download links
+            if download_info.download_links:
+                # Make sure all download_info links are in post.download_links
+                for link in download_info.download_links:
+                    link_exists = False
+                    for existing_link in post.download_links:
+                        if existing_link.get('url') == link.get('url'):
+                            link_exists = True
+                            break
+                    if not link_exists:
+                        post.download_links.append(link)
+            
+            # If no download links but we have buttons, create synthetic links
+            if not download_info.download_links and download_info.download_buttons:
+                for button in download_info.download_buttons:
+                    button_text = button.get("text", "")
+                    if button_text:
+                        # Create a synthetic link with a default URL pattern
+                        synthetic_link = {
+                            "url": f"https://weolbu.com/download/{post.post_id}?type=button&text={button_text}",
+                            "text": button_text
+                        }
+                        download_info.download_links.append(synthetic_link)
+                        post.download_links.append(synthetic_link)
+                        logging.info(f"[페이지 {post.post_id}] 합성 다운로드 링크 생성: {button_text}")
+            
+            # If still no download links but file_formats exists, create a generic link
+            if not post.download_links and download_info.file_formats:
+                for format in download_info.file_formats:
+                    generic_link = {
+                        "url": f"https://weolbu.com/download/{post.post_id}?format={format}",
+                        "text": f"{format.upper()} 다운로드"
+                    }
+                    download_info.download_links.append(generic_link)
+                    post.download_links.append(generic_link)
+                    logging.info(f"[페이지 {post.post_id}] 파일 형식 기반 다운로드 링크 생성: {format}")
+            
+        # Skip if no downloads after correction
+        if not download_info.has_download:
+            return post
+                    
         # Process each file
         for link in download_info.download_links:
             try:
                 download_url = link["url"]
                 
-                # Skip certificate PDFs
-                if "certificate" in download_url:
+                # Skip links flagged by the unified exclude list
+                if any(pat in (download_url.lower() + link.get("text", "").lower()) for pat in EXCLUDE_PATTERNS):
                     continue
-                    
+                
                 # Get filename
                 filename = os.path.basename(download_url.split("?")[0])
-                if not filename:
-                    filename = f"{link['text']}.pptx"
+                
+                # If no filename or no extension, try to infer from context
+                if not filename or not os.path.splitext(filename)[1]:
+                    # Get link text and HTML content if available
+                    link_text = link['text'].lower()
+                    page_content = post.content.lower() if post.content else ""
+                    
+                    # 1. Try to infer from download_info
+                    if download_info.file_formats and len(download_info.file_formats) > 0:
+                        ext = download_info.file_formats[0]  # Use the first detected format
+                        filename = f"{link['text']}.{ext}"
+                    
+                    # 2. Try to infer from link text
+                    elif 'pdf' in link_text:
+                        filename = f"{link['text']}.pdf"
+                    elif any(ext in link_text for ext in ['ppt', 'pptx']):
+                        filename = f"{link['text']}.pptx"
+                    elif any(ext in link_text for ext in ['doc', 'docx']):
+                        filename = f"{link['text']}.docx"
+                    elif 'hwp' in link_text:
+                        filename = f"{link['text']}.hwp"
+                    elif 'xlsx' in link_text or 'excel' in link_text:
+                        filename = f"{link['text']}.xlsx"
+                    
+                    # 3. For download buttons with no extension hints, check nearby context
+                    elif '다운로드' in link_text or 'download' in link_text:
+                        # Examine page content near the link text for file type hints
+                        if 'pdf' in page_content:
+                            filename = f"{link['text']}.pdf"
+                        elif any(ext in page_content for ext in ['pptx', '.ppt']):
+                            filename = f"{link['text']}.pptx"
+                        elif any(ext in page_content for ext in ['docx', '.doc']):
+                            filename = f"{link['text']}.docx"
+                        elif '.hwp' in page_content:
+                            filename = f"{link['text']}.hwp"
+                        elif '.xlsx' in page_content:
+                            filename = f"{link['text']}.xlsx"
+                        else:
+                            # Default to PDF for generic download buttons if no other clues
+                            # This is a reasonable default for most document downloads
+                            filename = f"{link['text']}.pdf"
+                    
+                    # 4. If still no format identified, use PDF as a sensible default
+                    # Not having a default was causing valid downloads to be skipped
+                    else:
+                        filename = f"{link['text']}.pdf"  # Default to PDF as most common document type
                 
                 # Process file and add to post
                 file_contents = self.file_processor.parse_file(download_url, post.post_id, filename)
