@@ -26,6 +26,140 @@ class DOCXParser:
         """Initialize the DOCX parser"""
         self.config = config or Config.get_instance()
         self.logger = logging.getLogger(__name__)
+        
+    def parse_bytes(self, file_obj) -> Dict[str, Any]:
+        """
+        Parse DOCX from BytesIO object
+        
+        Args:
+            file_obj: BytesIO object containing DOCX data
+            
+        Returns:
+            Dictionary with parsed content
+        """
+        try:
+            result = {
+                "content": "",
+                "metadata": {},
+                "tables": [],
+                "images": []
+            }
+            
+            # Process DOCX
+            doc = docx.Document(file_obj)
+            
+            # Extract paragraphs
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            result["content"] = "\n\n".join(paragraphs)
+            
+            # Extract tables
+            for table_idx, table in enumerate(doc.tables):
+                table_data = []
+                for row_idx, row in enumerate(table.rows):
+                    row_data = []
+                    for cell_idx, cell in enumerate(row.cells):
+                        row_data.append(cell.text)
+                    table_data.append(row_data)
+                
+                if table_data:
+                    # Convert to dictionary format
+                    if len(table_data) > 1:  # Has header and data
+                        headers = [str(h).strip() for h in table_data[0]]
+                        dict_data = []
+                        for row in table_data[1:]:
+                            row_dict = {}
+                            for i, cell in enumerate(row):
+                                if i < len(headers):
+                                    row_dict[headers[i]] = str(cell).strip()
+                            dict_data.append(row_dict)
+                            
+                        result["tables"].append({
+                            'index': table_idx,
+                            'headers': headers,
+                            'data': dict_data
+                        })
+                    else:
+                        # No header, just raw data
+                        result["tables"].append({
+                            'index': table_idx,
+                            'data': table_data
+                        })
+            
+            # Extract images using zipfile approach
+            try:
+                from zipfile import ZipFile
+                file_obj.seek(0)  # Reset file pointer
+                
+                with ZipFile(file_obj) as docx_zip:
+                    # Get list of all image files in the document
+                    image_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
+                    
+                    for img_idx, img_path in enumerate(image_files):
+                        try:
+                            # Extract image data
+                            image_bytes = docx_zip.read(img_path)
+                            
+                            # Save to temporary file for OCR
+                            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                                tmp_file.write(image_bytes)
+                                image_path = tmp_file.name
+                            
+                            # Perform OCR
+                            ocr_text = self._perform_ocr(image_path)
+                            
+                            # Add to images list
+                            result["images"].append({
+                                'index': img_idx,
+                                'filename': img_path.split('/')[-1],
+                                'ocr_text': ocr_text
+                            })
+                            
+                            # Clean up
+                            os.unlink(image_path)
+                        except Exception as e:
+                            self.logger.warning(f"Error extracting image {img_path}: {e}")
+            except Exception as e:
+                self.logger.warning(f"Error extracting images from DOCX: {e}")
+            
+            # Extract metadata
+            try:
+                core_properties = doc.core_properties
+                result["metadata"] = {
+                    'title': core_properties.title or '',
+                    'author': core_properties.author or '',
+                    'subject': core_properties.subject or '',
+                    'paragraph_count': len(doc.paragraphs),
+                    'table_count': len(doc.tables)
+                }
+            except Exception as e:
+                self.logger.warning(f"Error extracting metadata: {e}")
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing DOCX bytes: {e}")
+            return {"error": str(e), "content": f"DOCX 파일 처리 오류: {e}"}
+    
+    def _perform_ocr(self, image_path: str) -> str:
+        """
+        Perform OCR on an image file
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Extracted text from the image
+        """
+        try:
+            # Open image with PIL
+            img = Image.open(image_path)
+            
+            # Perform OCR with pytesseract
+            text = pytesseract.image_to_string(img, lang='kor+eng')
+            return text.strip()
+        except Exception as e:
+            self.logger.warning(f"OCR failed: {e}")
+            return ""
     
     def extract_content(self, docx_path: str) -> Dict[str, Any]:
         """
