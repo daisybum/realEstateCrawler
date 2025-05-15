@@ -212,4 +212,12 @@ tasks.json
 
 # Checkpoint files
 checkpoint.json
+
+# Development environment files
+.cursor/
+.roo/
+.roomodes
+.taskmasterconfig
+.windsurfrules
+scripts/task-complexity-report.json
 tasks/ 
