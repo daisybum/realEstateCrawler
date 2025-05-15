@@ -387,6 +387,8 @@ class Crawler:
         try:
             # Method 1: Using BeautifulSoup to find the download span
             soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # 패턴 1: '다운로드' 텍스트가 있는 span 요소 찾기
             download_spans = soup.find_all('span', class_='text-sm font-semibold', string='다운로드')
             
             for span in download_spans:
@@ -401,29 +403,112 @@ class Crawler:
                                 'text': link.get_text(strip=True) or '다운로드 파일'
                             })
             
-            # If no links found via BeautifulSoup, try XPath
+            # 패턴 2: 파일 확장자가 포함된 링크 찾기
+            if not download_links:
+                file_extensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.hwp']
+                for ext in file_extensions:
+                    # 확장자가 포함된 href 속성을 가진 링크 찾기
+                    ext_links = soup.find_all('a', href=lambda href: href and ext.lower() in href.lower())
+                    for link in ext_links:
+                        # 제외할 패턴 확인
+                        exclude = False
+                        for pattern in EXCLUDE_PATTERNS:
+                            if pattern.lower() in link.get_text().lower() or pattern.lower() in link.get('href', '').lower():
+                                exclude = True
+                                break
+                        
+                        if not exclude:
+                            download_links.append({
+                                'href': link.get('href'),
+                                'text': link.get_text(strip=True) or f'다운로드 파일{ext}'
+                            })
+            
+            # 패턴 3: '첨부', '자료', '파일' 등의 키워드가 포함된 링크 찾기
+            if not download_links:
+                download_keywords = ['첨부', '자료', '파일', '다운로드', '다운', '다운받기', '자료실', '문서']
+                for keyword in download_keywords:
+                    # 키워드가 포함된 텍스트를 가진 링크 찾기
+                    keyword_links = soup.find_all('a', string=lambda text: text and keyword in text)
+                    for link in keyword_links:
+                        if link.get('href') and not any(dl.get('href') == link.get('href') for dl in download_links):
+                            # 제외할 패턴 확인
+                            exclude = False
+                            for pattern in EXCLUDE_PATTERNS:
+                                if pattern.lower() in link.get_text().lower():
+                                    exclude = True
+                                    break
+                            
+                            if not exclude:
+                                download_links.append({
+                                    'href': link.get('href'),
+                                    'text': link.get_text(strip=True) or '다운로드 파일'
+                                })
+            
+            # 패턴 4: XPath를 사용한 다운로드 요소 찾기
             if not download_links:
                 # Method 2: Using lxml's XPath
                 import lxml.html
                 tree = lxml.html.fromstring(html_content)
-                download_elements = tree.xpath('/html/body/div[1]/div[3]/div/div/section[1]/div[4]/ul/li/div/div[2]/span')
                 
-                for element in download_elements:
-                    # Find parent li and then find links
-                    parent = element.getparent()
-                    while parent is not None and parent.tag != 'li':
-                        parent = parent.getparent()
+                # 다양한 XPath 패턴 시도
+                xpath_patterns = [
+                    '/html/body/div[1]/div[3]/div/div/section[1]/div[4]/ul/li/div/div[2]/span',
+                    '//span[contains(text(), "다운로드")]',
+                    '//a[contains(@href, ".pdf") or contains(@href, ".docx") or contains(@href, ".pptx")]',
+                    '//a[contains(text(), "첨부") or contains(text(), "자료") or contains(text(), "파일")]'
+                ]
+                
+                for xpath in xpath_patterns:
+                    elements = tree.xpath(xpath)
                     
-                    if parent is not None:
-                        links = parent.xpath('.//a')
-                        for link in links:
-                            if link.get('href'):
+                    for element in elements:
+                        # 링크 요소인 경우
+                        if element.tag == 'a' and element.get('href'):
+                            href = element.get('href')
+                            text = element.text_content().strip() if element.text_content() else '다운로드 파일'
+                            
+                            # 중복 확인
+                            if not any(dl.get('href') == href for dl in download_links):
                                 download_links.append({
-                                    'href': link.get('href'),
-                                    'text': link.text_content().strip() or '다운로드 파일'
+                                    'href': href,
+                                    'text': text
                                 })
+                        # 다른 요소인 경우 부모 요소에서 링크 찾기
+                        else:
+                            # Find parent li and then find links
+                            parent = element.getparent()
+                            while parent is not None and parent.tag != 'li':
+                                parent = parent.getparent()
+                            
+                            if parent is not None:
+                                links = parent.xpath('.//a')
+                                for link in links:
+                                    if link.get('href'):
+                                        href = link.get('href')
+                                        text = link.text_content().strip() if link.text_content() else '다운로드 파일'
+                                        
+                                        # 중복 확인
+                                        if not any(dl.get('href') == href for dl in download_links):
+                                            download_links.append({
+                                                'href': href,
+                                                'text': text
+                                            })
+            
+            # 결과에서 중복 제거
+            unique_links = []
+            seen_hrefs = set()
+            
+            for link in download_links:
+                href = link.get('href')
+                if href not in seen_hrefs:
+                    seen_hrefs.add(href)
+                    unique_links.append(link)
+            
+            return unique_links
+            
         except Exception as e:
             logging.error(f"Error detecting downloadable files: {e}")
+            return download_links
         
         return download_links
     
