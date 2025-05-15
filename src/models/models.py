@@ -57,15 +57,32 @@ class FileContent:
     url: str
     file_type: str
     content: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    tables: List[Dict[str, Any]] = field(default_factory=list)
+    images: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_dict(self, post_id: str) -> Dict[str, Any]:
         """Convert to dictionary"""
-        return {
+        result = {
             "post_id": post_id,
             "type": f"{self.file_type}_extract",
             "filename": self.filename,
             "content": self.content or f"{self.file_type.upper()} 파일 다운로드 링크: {self.url}\n파일명: {self.filename}"
         }
+        
+        # Add metadata if available
+        if self.metadata:
+            result["metadata"] = self.metadata
+            
+        # Add tables if available
+        if self.tables:
+            result["tables"] = self.tables
+            
+        # Add images if available
+        if self.images:
+            result["images"] = self.images
+            
+        return result
 
 
 @dataclass
@@ -78,6 +95,7 @@ class Post:
     content: str = ""
     images: List[Image] = field(default_factory=list)
     files: List[FileContent] = field(default_factory=list)
+    parsed_files: List[Dict[str, Any]] = field(default_factory=list)
     download_summary: str = "[다운로드 없음] "
     error: str = ""
     
@@ -151,6 +169,21 @@ class Post:
             file_rec = file.to_dict(self.post_id)
             file_rec["_download_summary"] = self.download_summary
             records.append(file_rec)
+            
+        # Add parsed files content
+        if self.parsed_files:
+            for parsed_file in self.parsed_files:
+                # Create a record for each parsed file
+                parsed_file_rec = {
+                    "post_id": self.post_id,
+                    "src": self.url,
+                    "title": self.title,
+                    "type": "parsed_file",
+                    "_download_summary": self.download_summary,
+                }
+                # Add all parsed file data
+                parsed_file_rec.update(parsed_file)
+                records.append(parsed_file_rec)
         
         # Add error if present
         if self.error:
@@ -164,6 +197,33 @@ class Post:
             records.append(error_rec)
         
         return records
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        result = {
+            "post_id": self.post_id,
+            "url": self.url,
+            "title": self.title,
+            "content": self.content,
+        }
+        
+        # Add error if present
+        if self.error:
+            result["error"] = self.error
+            
+        # Add images if present
+        if self.images:
+            result["images"] = [img.to_dict(self.post_id, self.url, self.title) for img in self.images]
+            
+        # Add files if present
+        if self.files:
+            result["files"] = [f.to_dict(self.post_id) for f in self.files]
+            
+        # Add parsed files if present
+        if self.parsed_files:
+            result["parsed_files"] = self.parsed_files
+            
+        return result
     
     def update_download_summary(self) -> None:
         """Update download summary based on download info"""

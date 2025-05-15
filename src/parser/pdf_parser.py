@@ -29,6 +29,171 @@ class PDFParser:
         """Initialize the PDF parser"""
         self.config = config or Config.get_instance()
         self.logger = logging.getLogger(__name__)
+        
+    def parse_bytes(self, file_obj) -> Dict[str, Any]:
+        """
+        Parse PDF from BytesIO object
+        
+        Args:
+            file_obj: BytesIO object containing PDF data
+            
+        Returns:
+            Dictionary with parsed content
+        """
+        try:
+            result = {
+                "content": "",
+                "metadata": {},
+                "tables": [],
+                "images": []
+            }
+            
+            # Extract text using PyMuPDF (fitz)
+            doc = fitz.open(stream=file_obj.read(), filetype="pdf")
+            
+            # Extract text
+            text_content = []
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text_content.append(page.get_text())
+            
+            result["content"] = "\n\n".join(text_content)
+            
+            # Extract metadata
+            metadata = doc.metadata
+            if metadata:
+                result["metadata"] = {
+                    'title': metadata.get('title', ''),
+                    'author': metadata.get('author', ''),
+                    'subject': metadata.get('subject', ''),
+                    'creator': metadata.get('creator', ''),
+                    'producer': metadata.get('producer', ''),
+                    'page_count': len(doc)
+                }
+            
+            # Extract images
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                image_list = page.get_images(full=True)
+                
+                for img_index, img in enumerate(image_list):
+                    try:
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image_ext = base_image["ext"]
+                        
+                        # Process image with OCR
+                        ocr_text = self._process_image_ocr(image_bytes)
+                        
+                        # Add to images list
+                        result["images"].append({
+                            'page': page_num + 1,
+                            'index': img_index,
+                            'width': base_image.get('width', 0),
+                            'height': base_image.get('height', 0),
+                            'format': image_ext,
+                            'ocr_text': ocr_text
+                        })
+                    except Exception as e:
+                        self.logger.warning(f"Error extracting image {img_index} from page {page_num+1}: {e}")
+            
+            # Extract tables using pdfplumber
+            try:
+                file_obj.seek(0)  # Reset file pointer
+                with pdfplumber.open(file_obj) as pdf:
+                    for page_num, page in enumerate(pdf.pages):
+                        page_tables = page.extract_tables()
+                        if page_tables:
+                            for table_idx, table in enumerate(page_tables):
+                                # Convert table to list of dictionaries
+                                if table and len(table) > 1:  # Has header and data
+                                    headers = [str(h).strip() for h in table[0]]
+                                    table_data = []
+                                    for row in table[1:]:
+                                        row_data = {}
+                                        for i, cell in enumerate(row):
+                                            if i < len(headers):
+                                                row_data[headers[i]] = str(cell).strip() if cell else ""
+                                        table_data.append(row_data)
+                                    
+                                    result["tables"].append({
+                                        'page': page_num + 1,
+                                        'index': table_idx,
+                                        'headers': headers,
+                                        'data': table_data
+                                    })
+            except Exception as e:
+                self.logger.warning(f"Error extracting tables from PDF: {e}")
+            
+            doc.close()
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing PDF bytes: {e}")
+            return {"error": str(e), "content": f"PDF 파일 처리 오류: {e}"}
+    
+    def _process_image_ocr(self, image_bytes):
+        """
+        Process image with OCR to extract text
+        
+        Args:
+            image_bytes: Image data as bytes
+            
+        Returns:
+            Extracted text from the image
+        """
+        try:
+            # Convert bytes to numpy array for OpenCV
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is None or img.size == 0:
+                return ""
+                
+            # Check if image is too small for meaningful OCR
+            if img.shape[0] < 50 or img.shape[1] < 50:
+                return ""  # Skip tiny images like icons
+                
+            # Preprocess image for better OCR results
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Apply adaptive thresholding
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # Try PaddleOCR first (better for Korean text)
+            paddle_result = ""
+            try:
+                result = PaddleOCR(use_angle_cls=True, lang='korean', show_log=False).ocr(img, cls=True)
+                if result and result[0]:
+                    for line in result[0]:
+                        if len(line) >= 2 and line[1] and len(line[1]) >= 2:
+                            text, confidence = line[1]
+                            if confidence > 0.5:  # Only include confident results
+                                paddle_result += text + " "
+            except Exception as e:
+                self.logger.warning(f"PaddleOCR failed: {e}")
+                
+            # If PaddleOCR failed, try pytesseract as fallback
+            if not paddle_result.strip():
+                try:
+                    # Convert OpenCV image to PIL Image for pytesseract
+                    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    pytess_result = pytesseract.image_to_string(pil_img, lang='kor+eng')
+                    return pytess_result.strip()
+                except Exception as e:
+                    self.logger.warning(f"Pytesseract OCR failed: {e}")
+                    return ""
+            
+            return paddle_result.strip()
+            
+        except Exception as e:
+            self.logger.error(f"Image OCR processing error: {e}")
+            return ""
     
     def extract_content(self, pdf_path: str) -> Dict[str, Any]:
         """
