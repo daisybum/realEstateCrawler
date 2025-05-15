@@ -25,20 +25,22 @@ tab = 100143
 subtab = 5
 
 [Credentials]
-# Login credentials (recommended to use environment variables instead)
-# login_id = your_username
-# login_pw = your_password
+# Login credentials (IMPORTANT: Use environment variables instead of hardcoding)
+# Set these in .env.crawler or use environment variables:
+# WEOLBU_LOGIN_ID and WEOLBU_LOGIN_PW
+login_id = YOUR_USERNAME_HERE
+login_pw = YOUR_PASSWORD_HERE
 
 [Browser]
 # User agent string
 user_agent = Mozilla/5.0 (WeolbuCrawler/0.5)
-# Run browser in headless mode
+# Run browser in headless mode (true for production, false for debugging)
 browser_headless = true
-# Disable automation detection
+# Disable automation detection (helps avoid bot detection)
 disable_automation = true
 # Disable sandbox (for containerized environments)
 no_sandbox = true
-# Disable shared memory
+# Disable shared memory (for containerized environments)
 disable_shm = true
 
 [Timeouts]
@@ -52,7 +54,7 @@ wait_page_load = 3
 wait_between_pages = 1
 
 [RateLimiting]
-# Enable rate limiting
+# Enable rate limiting to avoid being blocked
 rate_limit_enabled = true
 # Maximum requests per period
 rate_limit_requests = 5
@@ -60,13 +62,27 @@ rate_limit_requests = 5
 rate_limit_period = 10
 
 [Retry]
-# Maximum number of retries
+# Maximum number of retries for failed requests
 max_retries = 3
-# Delay between retries in seconds
+# Delay between retries in seconds (exponential backoff is applied)
 retry_delay = 5
 
 [FileTypes]
-# Supported file types (comma-separated)
+# Supported file types for document processing (comma-separated)
 supported_file_types = .pdf, .pptx, .docx, .hwp, .ppt, .doc, .xlsx, .xls
-# Excluded file types (comma-separated)
+# Excluded file types (images and other non-document files)
 excluded_file_types = .jpg, .jpeg, .png, .gif, .svg
+
+[Session]
+# Session timeout in seconds (30 minutes)
+session_timeout = 1800
+# Whether to automatically re-login when session expires
+auto_relogin = true
+
+[Logging]
+# Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+log_level = INFO
+# Whether to log to file
+log_to_file = true
+# Log file path (relative to project root)
+log_file = logs/crawler.log
