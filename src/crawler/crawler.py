@@ -10,7 +10,10 @@ import time
 import logging
 import hashlib
 import urllib.robotparser
-from datetime import datetime
+import traceback
+import psutil
+import gc
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Any, Tuple, Optional, Generator, Set
 
@@ -30,7 +33,8 @@ from src.config import Config
 from src.crawler.auth import Authenticator, AuthenticationError
 from src.parser.parser import ContentParser, ListParser
 from src.models.models import Post, DownloadInfo, Image, FileContent
-from src.storage.file_processor import FileProcessor, DownloadDetector
+from src.storage.file_processor import FileProcessor
+from src.crawler.download_detector import DownloadDetector
 from src.storage.storage import JsonlStorage, CheckpointManager
 
 
@@ -79,6 +83,16 @@ class Crawler:
         # Rate limiting settings
         self.last_request_time = None
         self.request_count = 0
+        
+        # Performance monitoring
+        self.start_time = datetime.now()
+        self.memory_usage_samples = []
+        self.cpu_usage_samples = []
+        self.sample_interval = 60  # seconds between resource samples
+        self.last_sample_time = None
+        
+        # Tracking visited URLs to avoid duplicates
+        self.visited_urls = set()
         self.rate_limit_window_start = datetime.now()
         
         # Create driver
@@ -227,21 +241,56 @@ class Crawler:
                     raise
     
     def crawl(self):
-        """Main crawling method"""
+        """Main crawling method for extracting posts from list pages and processing them"""
+        start_time = datetime.now()
+        total_posts_processed = 0
+        total_files_processed = 0
+        error_count = 0
+        
+        # Performance statistics
+        performance_stats = {
+            'network_errors': 0,
+            'parsing_errors': 0,
+            'file_processing_errors': 0,
+            'request_times': [],
+            'page_processing_times': [],
+            'file_processing_times': []
+        }
+        
         try:
+            logging.info(f"Starting crawl at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
             # Login and get authentication headers
-            self.auth_headers, self.driver = self.authenticator.login()
+            try:
+                self.auth_headers, self.driver = self.authenticator.login()
+                logging.info("Authentication successful")
+            except AuthenticationError as auth_e:
+                logging.error(f"Authentication failed: {auth_e}")
+                return
+            except Exception as e:
+                logging.error(f"Unexpected error during authentication: {e}")
+                return
             
             # Get last processed page from checkpoint
-            page = self.checkpoint_manager.get_last_page()
+            try:
+                page = self.checkpoint_manager.get_last_page()
+                logging.info(f"Resuming from page {page} based on checkpoint")
+            except Exception as e:
+                logging.warning(f"Could not get last page from checkpoint: {e}. Starting from page 1.")
+                page = 1
             
             # Create progress bar
             pbar = tqdm(desc="Page", initial=page-1)
+            
+            # Track consecutive empty pages for better termination detection
+            consecutive_empty_pages = 0
+            max_consecutive_empty = self.config.max_consecutive_empty_pages if hasattr(self.config, 'max_consecutive_empty_pages') else 3
             
             # Process pages
             while True:
                 # Construct page URL
                 page_url = f"{self.config.specific_list_url}&page={page}"
+                logging.info(f"Processing page {page}: {page_url}")
                 
                 # Check if URL is allowed by robots.txt
                 if not self._can_fetch(page_url):
@@ -250,30 +299,91 @@ class Crawler:
                 
                 # Get post list for current page
                 try:
-                    posts = self.list_parser.parse_list_api(page, self.auth_headers, self.driver)
-                except Exception as e:
-                    logging.error(f"Page {page} failed: {e}")
-                    # Try a few more times with exponential backoff
-                    retry_success = False
-                    for retry in range(self.config.max_retries):
-                        backoff = self.config.retry_delay * (2 ** retry)
-                        logging.info(f"Retrying page {page} in {backoff} seconds...")
-                        time.sleep(backoff)
-                        try:
-                            posts = self.list_parser.parse_list_api(page, self.auth_headers, self.driver)
-                            retry_success = True
-                            break
-                        except Exception as retry_e:
-                            logging.error(f"Retry {retry+1} failed: {retry_e}")
+                    # Track page processing time
+                    page_start_time = time.time()
                     
-                    if not retry_success:
-                        logging.error(f"Giving up on page {page} after {self.config.max_retries} retries")
+                    # Get page content first to extract pagination info
+                    request_start_time = time.time()
+                    page_content = self.get_page(page_url)
+                    request_time = time.time() - request_start_time
+                    performance_stats['request_times'].append(request_time)
+                    
+                    page_size = len(page_content)
+                    logging.debug(f"Retrieved page {page} content ({page_size} bytes) in {request_time:.2f}s")
+                    
+                    if page_size < 100:  # Suspiciously small page
+                        logging.warning(f"Page {page} content is suspiciously small ({page_size} bytes). Content: {page_content[:100]}")
+                    
+                    # Extract pagination info using the improved method
+                    current_page, last_page, has_next = self._extract_pagination_info(page_content, page)
+                    
+                    # Log pagination info
+                    logging.info(f"Page {current_page} of {last_page}, has next: {has_next}")
+                    
+                    # Check if we've reached the last page
+                    if current_page >= last_page and not has_next:
+                        logging.info(f"Reached last page ({last_page}), ending crawl")
                         break
+                    
+                    # Parse posts from the page
+                    posts = self.parse_list_api(page, page_content)
+                    
+                    # Record page processing time
+                    page_processing_time = time.time() - page_start_time
+                    performance_stats['page_processing_times'].append(page_processing_time)
+                    logging.debug(f"Processed page {page} in {page_processing_time:.2f}s")
+                    
+                except requests.exceptions.RequestException as req_e:
+                    error_count += 1
+                    performance_stats['network_errors'] += 1
+                    logging.error(f"Network error on page {page}: {req_e}")
+                    logging.debug(f"Network error details: {traceback.format_exc()}")
+                    
+                    # Monitor resources during error recovery
+                    self._monitor_resources()
+                    
+                    # Try to recover with exponential backoff
+                    retry_success = self._retry_page(page, page_url)
+                    if not retry_success:
+                        logging.error(f"Failed to recover from network error after retries, ending crawl")
+                        break
+                    continue
+                    
+                except Exception as e:
+                    error_count += 1
+                    performance_stats['parsing_errors'] += 1
+                    logging.error(f"Error processing page {page}: {e}")
+                    logging.debug(f"Error details: {traceback.format_exc()}")
+                    
+                    # Monitor resources during error recovery
+                    self._monitor_resources()
+                    
+                    # Try to recover with exponential backoff
+                    retry_success = self._retry_page(page, page_url)
+                    if not retry_success:
+                        logging.error(f"Failed to recover from parsing error after retries, ending crawl")
+                        break
+                    continue
                 
-                # Break if no posts found
+                # Handle empty pages
                 if not posts:
-                    logging.info(f"No posts found on page {page}, ending crawl")
-                    break
+                    logging.info(f"No posts found on page {page}")
+                    consecutive_empty_pages += 1
+                    
+                    if consecutive_empty_pages >= max_consecutive_empty:
+                        logging.info(f"Found {consecutive_empty_pages} consecutive empty pages, ending crawl")
+                        break
+                else:
+                    # Reset counter when we find posts
+                    consecutive_empty_pages = 0
+                    logging.info(f"Found {len(posts)} posts on page {page}")
+                    total_posts_processed += len(posts)
+                    
+                    # Track file processing for statistics
+                    files_on_page = 0
+                
+                # Monitor system resources periodically
+                self._monitor_resources()
                 
                 # Process each post
                 for title, link in tqdm(posts, desc=f"Posts p{page}", leave=False):
@@ -302,7 +412,196 @@ class Crawler:
                     self._rate_limit()
                     
                     # Parse post
+                    try:
+                        post_records = self._parse_post(link, title, pid)
+                        
+                        # Count files processed
+                        for rec in post_records:
+                            if "parsed_files" in rec and rec["parsed_files"]:
+                                files_on_page += len(rec["parsed_files"])
+                                total_files_processed += len(rec["parsed_files"])
+                        
+                        # Get download summary
+                        download_summary = "[다운로드 없음] "
+                        for rec in post_records:
+                            if "_download_summary" in rec:
+                                download_summary = rec["_download_summary"]
+                                break
+                        
+                        # Save checkpoint and posts
+                        self.checkpoint_manager.save(page, download_summary)
+                        self.storage.save_posts(post_records)
+                    except Exception as e:
+                        error_count += 1
+                        logging.error(f"Error processing post {pid} ({link}): {e}", exc_info=True)
+                        continue
+                
+                # Go to next page
+                page += 1
+                pbar.update(1)
+                
+                # Apply rate limiting between pages
+                self._rate_limit()
+            
+            pbar.close()
+            
+            # Log crawl statistics
+            end_time = datetime.now()
+            duration = end_time - start_time
+            logging.info(f"Crawl completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"Crawl duration: {duration}")
+            logging.info(f"Total pages processed: {page-1}")
+            logging.info(f"Total posts processed: {total_posts_processed}")
+            logging.info(f"Total files processed: {total_files_processed}")
+            logging.info(f"Total errors encountered: {error_count}")
+            
+        finally:
+            # Clean up resources
+            logging.info("Cleaning up resources...")
+            try:
+                if self.driver:
+                    self.driver.quit()
+                    self.driver = None
+                    logging.info("WebDriver closed successfully")
+            except Exception as e:
+                logging.error(f"Error closing WebDriver: {e}")
+                
+            # Force garbage collection
+            gc.collect()
+            
+            # Log final resource usage
+            try:
+                process = psutil.Process(os.getpid())
+                memory_info = process.memory_info()
+                memory_usage_mb = memory_info.rss / 1024 / 1024
+                cpu_percent = process.cpu_percent(interval=0.1)
+                logging.info(f"Final memory usage: {memory_usage_mb:.2f} MB, CPU usage: {cpu_percent:.2f}%")
+            except Exception as e:
+                logging.error(f"Error getting resource usage: {e}")
+    
+    def _retry_page(self, page: int, page_url: str) -> bool:
+        """Retry fetching and processing a page with exponential backoff
+        
+        Args:
+            page: Page number to retry
+            page_url: URL of the page to retry
+            
+        Returns:
+            True if retry was successful, False otherwise
+        """
+        retry_success = False
+        for retry in range(self.config.max_retries):
+            backoff = self.config.retry_delay * (2 ** retry)
+            logging.info(f"Retrying page {page} in {backoff} seconds... (Attempt {retry+1}/{self.config.max_retries})")
+            time.sleep(backoff)
+            try:
+                page_content = self.get_page(page_url)
+                posts = self.parse_list_api(page, page_content)
+                retry_success = True
+                logging.info(f"Retry {retry+1} successful for page {page}")
+                break
+            except Exception as retry_e:
+                logging.error(f"Retry {retry+1} failed for page {page}: {retry_e}")
+        
+        if not retry_success:
+            logging.error(f"Giving up on page {page} after {self.config.max_retries} retries")
+            # Save checkpoint before exiting
+            try:
+                self.checkpoint_manager.save_checkpoint(page - 1)
+                logging.info(f"Saved checkpoint at page {page-1}")
+            except Exception as e:
+                logging.error(f"Failed to save checkpoint: {e}")
+        
+        return retry_success
+        
+    def _monitor_resources(self) -> None:
+        """Monitor system resources and log if thresholds are exceeded
+        
+        This method samples CPU and memory usage at regular intervals and logs warnings
+        if usage exceeds configured thresholds. It also performs garbage collection
+        if memory usage is high.
+        """
+        now = datetime.now()
+        
+        # Only sample at configured intervals
+        if self.last_sample_time and (now - self.last_sample_time).total_seconds() < self.sample_interval:
+            return
+            
+        self.last_sample_time = now
+        
+        # Get current memory usage
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        memory_usage_mb = memory_info.rss / 1024 / 1024
+        self.memory_usage_samples.append(memory_usage_mb)
+        
+        # Get CPU usage
+        cpu_percent = process.cpu_percent(interval=0.1)
+        self.cpu_usage_samples.append(cpu_percent)
+        
+        # Log resource usage
+        logging.debug(f"Memory usage: {memory_usage_mb:.2f} MB, CPU usage: {cpu_percent:.2f}%")
+        
+        # Check if memory usage is high
+        memory_threshold = getattr(self.config, 'memory_threshold_mb', 1000)  # Default 1GB
+        if memory_usage_mb > memory_threshold:
+            logging.warning(f"High memory usage detected: {memory_usage_mb:.2f} MB > {memory_threshold} MB threshold")
+            logging.info("Performing garbage collection to free memory")
+            gc.collect()
+            
+        # Check if CPU usage is high
+        cpu_threshold = getattr(self.config, 'cpu_threshold_percent', 90)  # Default 90%
+        if cpu_percent > cpu_threshold:
+            logging.warning(f"High CPU usage detected: {cpu_percent:.2f}% > {cpu_threshold}% threshold")
+            
+        # Limit the number of samples we keep
+        max_samples = 100
+        if len(self.memory_usage_samples) > max_samples:
+            self.memory_usage_samples = self.memory_usage_samples[-max_samples:]
+        if len(self.cpu_usage_samples) > max_samples:
+            self.cpu_usage_samples = self.cpu_usage_samples[-max_samples:]
+                
+            # Process each post
+            for title, link in tqdm(posts, desc=f"Posts p{page}", leave=False):
+                # Skip if URL is not allowed by robots.txt
+                if not self._can_fetch(link):
+                    logging.warning(f"Post URL not allowed by robots.txt: {link}")
+                    continue
+                
+                # Skip if we've already visited this URL
+                if link in self.visited_urls:
+                    logging.info(f"Skipping already visited URL: {link}")
+                    continue
+                
+                # Mark URL as visited
+                self.visited_urls.add(link)
+                
+                # Extract post ID from URL
+                pid_match = re.search(r"/community/(\d+)", link)
+                if not pid_match:
+                    logging.warning(f"Could not extract post ID from {link}")
+                    continue
+                    
+                pid = pid_match.group(1)
+                
+                # Apply rate limiting
+                self._rate_limit()
+                
+                # Parse post
+                try:
+                    file_processing_start = time.time()
                     post_records = self._parse_post(link, title, pid)
+                    file_processing_time = time.time() - file_processing_start
+                    performance_stats['file_processing_times'].append(file_processing_time)
+                    
+                    # Count files processed
+                    files_in_post = 0
+                    for rec in post_records:
+                        if "parsed_files" in rec and rec["parsed_files"]:
+                            files_in_post += len(rec["parsed_files"])
+                            total_files_processed += len(rec["parsed_files"])
+                    
+                    logging.debug(f"Processed {files_in_post} files from post {pid} in {file_processing_time:.2f}s")
                     
                     # Get download summary
                     download_summary = "[다운로드 없음] "
@@ -314,21 +613,174 @@ class Crawler:
                     # Save checkpoint and posts
                     self.checkpoint_manager.save(page, download_summary)
                     self.storage.save_posts(post_records)
-                
-                # Go to next page
-                page += 1
-                pbar.update(1)
-                
-                # Apply rate limiting between pages
-                self._rate_limit()
+                except Exception as e:
+                    error_count += 1
+                    performance_stats['file_processing_errors'] += 1
+                    logging.error(f"Error processing post {pid} ({link}): {e}")
+                    logging.debug(f"Error details: {traceback.format_exc()}")
+                    continue
             
+            # Go to next page
+            page += 1
+            pbar.update(1)
+            
+            # Apply rate limiting between pages
+            self._rate_limit()
+        
             pbar.close()
             
-        finally:
-            # Clean up
-            if self.driver:
-                self.driver.quit()
+            # Log crawl statistics
+            end_time = datetime.now()
+            duration = end_time - start_time
+            logging.info(f"Crawl completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"Crawl duration: {duration}")
+            logging.info(f"Total pages processed: {page-1}")
+            logging.info(f"Total posts processed: {total_posts_processed}")
+            logging.info(f"Total files processed: {total_files_processed}")
+            logging.info(f"Total errors encountered: {error_count}")
+            
+            # Log performance statistics
+            if performance_stats['request_times']:
+                avg_request_time = sum(performance_stats['request_times']) / len(performance_stats['request_times'])
+                logging.info(f"Average request time: {avg_request_time:.2f}s")
+            
+            if performance_stats['page_processing_times']:
+                avg_page_time = sum(performance_stats['page_processing_times']) / len(performance_stats['page_processing_times'])
+                logging.info(f"Average page processing time: {avg_page_time:.2f}s")
+            
+            if performance_stats['file_processing_times']:
+                avg_file_time = sum(performance_stats['file_processing_times']) / len(performance_stats['file_processing_times'])
+                logging.info(f"Average file processing time: {avg_file_time:.2f}s")
+            
+            logging.info(f"Network errors: {performance_stats['network_errors']}")
+            logging.info(f"Parsing errors: {performance_stats['parsing_errors']}")
+            logging.info(f"File processing errors: {performance_stats['file_processing_errors']}")
+            
+            # Clean up resources
+            logging.info("Cleaning up resources...")
+            try:
+                if self.driver:
+                    self.driver.quit()
+                    self.driver = None
+                    logging.info("WebDriver closed successfully")
+            except Exception as e:
+                logging.error(f"Error closing WebDriver: {e}")
+                
+            # Force garbage collection
+            gc.collect()
+            
+            # Log final resource usage
+            try:
+                process = psutil.Process(os.getpid())
+                memory_info = process.memory_info()
+                memory_usage_mb = memory_info.rss / 1024 / 1024
+                cpu_percent = process.cpu_percent(interval=0.1)
+                logging.info(f"Final memory usage: {memory_usage_mb:.2f} MB, CPU usage: {cpu_percent:.2f}%")
+            except Exception as e:
+                logging.error(f"Error getting resource usage: {e}")
     
+    def _extract_pagination_info(self, html_content: str, current_page: int) -> Tuple[int, int, bool]:
+        """
+        Extract pagination information from HTML content
+        
+        Args:
+            html_content: HTML content to extract pagination from
+            current_page: Current page number
+            
+        Returns:
+            Tuple of (current_page, last_page, has_next)
+        """
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Find pagination elements using common selectors
+            pagination = soup.select('.pagination a, .pagination span, .paging a, .paging span, .paginate a, .paginate span, .page-numbers, .page-item a')
+            if not pagination:
+                # Try broader selectors if specific ones don't match
+                pagination = soup.select('a[href*="page="], a[href*="pageIndex="], a[href*="pageNo="]')
+                
+            if not pagination:
+                return current_page, current_page, False
+            
+            # Extract page numbers
+            page_numbers = []
+            has_next = False
+            active_page = None
+            
+            # Korean pagination terms
+            next_terms = ['다음', '다음 페이지', '다음페이지', '>', '>>', '→']
+            prev_terms = ['이전', '이전 페이지', '이전페이지', '<', '<<', '←']
+            
+            for item in pagination:
+                text = item.text.strip()
+                
+                # Check for active/current page
+                if item.parent and item.parent.get('class') and any(c in ['active', 'current', 'selected'] for c in item.parent.get('class')):
+                    try:
+                        active_page = int(text)
+                    except ValueError:
+                        pass
+                
+                # Check for next page indicator
+                if text in next_terms or any(term in text for term in next_terms):
+                    has_next = True
+                    continue
+                
+                # Skip previous page indicators
+                if text in prev_terms or any(term in text for term in prev_terms):
+                    continue
+                    
+                # Try to extract page number
+                try:
+                    # Handle cases like "1/10" format
+                    if '/' in text:
+                        parts = text.split('/')
+                        if len(parts) == 2 and parts[1].strip().isdigit():
+                            page_numbers.append(int(parts[1].strip()))
+                            continue
+                    
+                    # Regular page number
+                    page_number = int(text)
+                    page_numbers.append(page_number)
+                except ValueError:
+                    # Skip non-numeric text that isn't a pagination control
+                    pass
+            
+            # Use active page if found, otherwise use provided current_page
+            if active_page is not None:
+                current_page = active_page
+            
+            # Determine last page
+            last_page = max(page_numbers) if page_numbers else current_page
+            
+            # If we're on the last page, there's no next page
+            if current_page >= last_page:
+                has_next = False
+            
+            # Sanity check: if current_page > last_page, adjust last_page
+            if current_page > last_page:
+                last_page = current_page
+            
+            # Look for text like "Page 1 of 10" if we still don't have a last page
+            if last_page == current_page and not page_numbers:
+                for elem in soup.select('div, p, span'):
+                    page_text = elem.get_text()
+                    match = re.search(r'(?:Page|페이지)\s*(\d+)\s*(?:of|중|/)\s*(\d+)', page_text)
+                    if match:
+                        try:
+                            current_page = int(match.group(1))
+                            last_page = int(match.group(2))
+                            has_next = current_page < last_page
+                            break
+                        except (ValueError, TypeError):
+                            continue
+            
+            return current_page, last_page, has_next
+            
+        except Exception as e:
+            logging.error(f"Error extracting pagination info: {e}")
+            return current_page, current_page, False
+        
     def _normalize_url(self, url: str) -> str:
         """
         Normalize URL by adding base URL if needed and handling relative paths
@@ -339,16 +791,112 @@ class Crawler:
         Returns:
             Normalized URL
         """
-        # Handle empty URLs
-        if not url:
-            return ""
-            
-        # Handle URLs that are already absolute
-        if url.startswith('http://') or url.startswith('https://'):
-            return url
-            
         # Handle relative URLs
+        if url.startswith('/'):
+            return urljoin(self.config.base_url, url)
+        # Handle URLs without scheme
+        elif not url.startswith(('http://', 'https://')):
+            return urljoin(self.config.base_url, url)
+        # Return as is if already absolute
         return urljoin(self.config.base_url, url)
+    
+    def parse_list_api(self, page: int, page_content: str) -> List[Tuple[str, str]]:
+        """
+        Parse the list page to extract post titles and URLs
+        
+        Args:
+            page: Page number
+            page_content: HTML content of the page
+            
+        Returns:
+            List of tuples containing (title, url) for each post
+        """
+        posts = []
+        soup = BeautifulSoup(page_content, 'html.parser')
+        
+        # Try multiple strategies to find post containers
+        strategies = [
+            # Strategy 1: Common class-based selectors
+            lambda s: s.select('.post-item, .board-list tr, article.post, .list-item, .board-item'),
+            
+            # Strategy 2: Table-based layouts
+            lambda s: s.select('table.board-list tbody tr, table.list tbody tr, table.board tbody tr'),
+            
+            # Strategy 3: List-based layouts
+            lambda s: s.select('ul.board-list li, ol.board-list li, div.board-list > div'),
+            
+            # Strategy 4: Generic table rows with title/subject cells
+            lambda s: s.select('tr:has(td.title), tr:has(td.subject), tr:has(a.title), tr:has(a.subject)'),
+            
+            # Strategy 5: Find all links that might be post titles
+            lambda s: [a.parent for a in s.select('a[href*="/community/"], a[href*="/board/"], a[href*="/post/"]')]
+        ]
+        
+        # Try each strategy until we find post containers
+        post_containers = []
+        for strategy in strategies:
+            post_containers = strategy(soup)
+            if post_containers:
+                logging.debug(f"Found {len(post_containers)} post containers using strategy {strategies.index(strategy)+1}")
+                break
+        
+        # If we still don't have containers, try a more aggressive approach
+        if not post_containers:
+            # Look for any table rows that might be posts
+            tables = soup.select('table')
+            for table in tables:
+                rows = table.select('tr')
+                if len(rows) > 1:  # Skip tables with only one row
+                    # Skip header row
+                    post_containers.extend(rows[1:])
+        
+        # Process each post container
+        for container in post_containers:
+            # Multiple strategies to extract title and URL
+            link_elem = None
+            
+            # Strategy 1: Look for specific title elements
+            for selector in ['a.title', 'td.title a', '.subject a', 'h3.title a', '.list-title a', '.post-title a']:
+                link_elem = container.select_one(selector)
+                if link_elem:
+                    break
+            
+            # Strategy 2: Look for any link with post-like URL patterns
+            if not link_elem:
+                for link in container.select('a[href]'):
+                    href = link.get('href', '')
+                    if any(pattern in href for pattern in ['/community/', '/board/', '/post/', '/view/', '/read/']):
+                        link_elem = link
+                        break
+            
+            # Strategy 3: Just take the first link if nothing else worked
+            if not link_elem and container.select('a[href]'):
+                link_elem = container.select('a[href]')[0]
+            
+            if link_elem:
+                # Extract title, handling various formats
+                title = link_elem.get_text(strip=True)
+                
+                # If title is empty, try to find it elsewhere in the container
+                if not title:
+                    title_elem = container.select_one('.title, .subject, .post-title, .list-title')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                
+                # Extract URL
+                url = link_elem.get('href', '')
+                
+                # Normalize URL
+                url = self._normalize_url(url)
+                
+                # Validate and add to results
+                if title and url and self._is_valid_url(url):
+                    # Check for duplicates before adding
+                    if not any(existing_url == url for _, existing_url in posts):
+                        posts.append((title, url))
+        
+        logging.info(f"Found {len(posts)} posts on page {page}")
+        return posts
     
     def _is_valid_url(self, url: str) -> bool:
         """
@@ -379,46 +927,26 @@ class Crawler:
         return hashlib.md5(url.encode('utf-8')).hexdigest()
     
     def _detect_downloadable_files(self, html_content: str) -> List[Dict[str, str]]:
-        """
-        Detect downloadable files using DownloadDetector
-        
+        """Detect downloadable files in a page using DownloadDetector.
         Args:
-            html_content: HTML content of the page
-            
+            html_content: Raw HTML of the page.
         Returns:
-            List of dictionaries containing download information
+            A deduplicated list of dictionaries with keys ``href`` and ``text``.
         """
         try:
-            # BeautifulSoup 객체 생성
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # DownloadDetector 클래스의 check_for_downloads_soup 메서드 활용
-            # 빈 문자열은 URL과 post ID 자리에 임시로 넣은 값
-            download_info = self.download_detector.check_for_downloads_soup(soup, "", "")
-            
-            # 결과를 저장할 리스트
-            download_links = []
-            
-            # DownloadInfo 객체에서 다운로드 링크 추출
-            if download_info and hasattr(download_info, 'download_links'):
-                for link in download_info.download_links:
-                    download_links.append({
-                        'href': link.get('url', ''),  # DownloadDetector에서는 'url'로 저장됨
-                        'text': link.get('text', '다운로드 파일')
-                    })
-            
-            # 결과에서 중복 제거
-            unique_links = []
-            seen_hrefs = set()
-            
-            for link in download_links:
-                href = link.get('href')
-                if href and href not in seen_hrefs:
-                    seen_hrefs.add(href)
-                    unique_links.append(link)
-            
-            return unique_links
-            
+            detections = self.download_detector.detect_downloads(html_content)
+            unique: Dict[str, Dict[str, str]] = {}
+            for d in detections:
+                href = d.get("url")
+                if not href:
+                    continue
+                # Prefer the first non-empty text we encounter for a given href
+                if href not in unique or (not unique[href]["text"] and d.get("text")):
+                    unique[href] = {
+                        "href": href,
+                        "text": d.get("text") or "다운로드 파일",
+                    }
+            return list(unique.values())
         except Exception as e:
             logging.error(f"Error detecting downloadable files: {e}")
             return []
@@ -432,8 +960,13 @@ class Crawler:
             filename: Filename to use for the file
             
         Returns:
-            Dictionary containing parsed content
+            Dictionary containing parsed content and content hash
         """
+        download_start_time = time.time()
+        file_bytes = None
+        content_hash = None
+        file_size = 0
+        
         try:
             # Apply rate limiting
             self._rate_limit()
@@ -441,81 +974,182 @@ class Crawler:
             # Check robots.txt
             if not self._can_fetch(url):
                 logging.warning(f"URL not allowed by robots.txt: {url}")
-                return {"error": "URL not allowed by robots.txt"}
+                return {"error": "URL not allowed by robots.txt", "filename": filename, "url": url}
             
-            # 파일 확장자 추출
-            file_ext = os.path.splitext(filename)[1].lower()
+            # Download file content using requests to get raw bytes for hash calculation
+            try:
+                logging.debug(f"Downloading file from {url}")
+                response = requests.get(url, headers=self.auth_headers, timeout=self.config.request_timeout)
+                response.raise_for_status()
+                file_bytes = response.content
+                file_size = len(file_bytes)
+                
+                # Calculate content hash
+                hash_start_time = time.time()
+                content_hash = self._calculate_content_hash(file_bytes)
+                hash_time = time.time() - hash_start_time
+                
+                logging.debug(f"Downloaded {file_size} bytes, hash: {content_hash} (calculated in {hash_time:.2f}s)")
+            except requests.exceptions.RequestException as download_error:
+                logging.error(f"Network error downloading file {url}: {download_error}")
+                return {
+                    "error": f"Download error: {str(download_error)}", 
+                    "filename": filename, 
+                    "url": url,
+                    "file_size": 0,
+                    "download_time": time.time() - download_start_time
+                }
+            except Exception as download_error:
+                logging.error(f"Error downloading file {url}: {download_error}")
+                logging.debug(f"Error details: {traceback.format_exc()}")
+                return {
+                    "error": f"Download error: {str(download_error)}", 
+                    "filename": filename, 
+                    "url": url,
+                    "file_size": 0,
+                    "download_time": time.time() - download_start_time
+                }
             
-            # FileProcessor의 parse_file 메서드를 사용하여 파일 다운로드 및 파싱 수행
-            # post_id는 사용하지 않으므로 빈 문자열 전달
-            file_contents = self.file_processor.parse_file(url, "", filename)
+            # Parse file using FileProcessor
+            parse_start_time = time.time()
+            try:
+                file_contents = self.file_processor.parse_file(url, "", filename)
+                parse_time = time.time() - parse_start_time
+                logging.debug(f"Parsed file in {parse_time:.2f}s")
+            except Exception as parse_error:
+                logging.error(f"Error parsing file {filename} from {url}: {parse_error}")
+                logging.debug(f"Error details: {traceback.format_exc()}")
+                return {
+                    "error": f"Parse error: {str(parse_error)}", 
+                    "filename": filename, 
+                    "url": url,
+                    "hash": content_hash,
+                    "file_size": file_size,
+                    "download_time": parse_start_time - download_start_time,
+                    "parse_time": 0
+                }
             
-            # 파싱 결과가 없는 경우 오류 반환
+            # Handle empty parsing results
             if not file_contents or len(file_contents) == 0:
-                return {"error": "Failed to parse file", "filename": filename, "url": url}
+                return {
+                    "error": "Failed to parse file", 
+                    "filename": filename, 
+                    "url": url,
+                    "hash": content_hash,  # Still include hash even if parsing failed
+                    "file_size": file_size,
+                    "download_time": parse_start_time - download_start_time,
+                    "parse_time": time.time() - parse_start_time
+                }
             
-            # 처리된 첫 번째 파일 콘텐츠 가져오기
+            # Get first file content object
             file_content = file_contents[0]
             
-            # 결과를 리턴할 데이터 구성
+            # Calculate total processing time
+            total_processing_time = time.time() - download_start_time
+            
+            # Extract file properties safely
             parsed_content = {
                 "filename": filename,
                 "url": url,
-                "content": file_content.text if hasattr(file_content, 'text') else "",
-                "metadata": file_content.metadata if hasattr(file_content, 'metadata') else {},
-                "file_type": file_content.file_type if hasattr(file_content, 'file_type') else os.path.splitext(filename)[1][1:]
+                "content": getattr(file_content, 'content', ""),
+                "metadata": getattr(file_content, 'metadata', {}),
+                "file_type": getattr(file_content, 'file_type', os.path.splitext(filename)[1][1:] or 'pdf'),
+                "hash": content_hash,
+                "file_size": file_size,
+                "download_time": parse_start_time - download_start_time,
+                "parse_time": time.time() - parse_start_time,
+                "total_processing_time": total_processing_time
             }
             
-            # 이미지 처리
-            if hasattr(file_content, 'images') and file_content.images:
+            # Log processing metrics
+            logging.debug(f"File processing metrics for {filename}: size={file_size} bytes, " 
+                         f"download={parsed_content['download_time']:.2f}s, " 
+                         f"parse={parsed_content['parse_time']:.2f}s, " 
+                         f"total={total_processing_time:.2f}s")
+            
+            # Process images if available
+            images = getattr(file_content, 'images', [])
+            if images:
                 parsed_content["images"] = []
                 ocr_texts = []
                 
-                for img in file_content.images:
+                for img in images:
                     img_data = {}
-                    
                     if hasattr(img, 'data'):
                         img_data["data"] = img.data
                     
-                    if hasattr(img, 'ocr_text') and img.ocr_text and img.ocr_text.strip():
-                        img_data["ocr_text"] = img.ocr_text
-                        ocr_texts.append(f"Image OCR: {img.ocr_text}")
+                    ocr_text = getattr(img, 'ocr_text', "").strip()
+                    if ocr_text:
+                        img_data["ocr_text"] = ocr_text
+                        ocr_texts.append(f"Image OCR: {ocr_text}")
                     
                     parsed_content["images"].append(img_data)
                 
-                # OCR 텍스트 추가
+                # Add OCR text to content if available
                 if ocr_texts:
-                    if parsed_content["content"]:
-                        parsed_content["content"] += "\n\n===== OCR Text from Images =====\n" + "\n\n".join(ocr_texts)
-                    else:
-                        parsed_content["content"] = "===== OCR Text from Images =====\n" + "\n\n".join(ocr_texts)
+                    ocr_section = "\n\n===== OCR Text from Images =====\n" + "\n\n".join(ocr_texts)
+                    parsed_content["content"] = (parsed_content["content"] + ocr_section) if parsed_content["content"] else ocr_section
             
-            # 테이블 처리
-            if hasattr(file_content, 'tables') and file_content.tables:
+            # Process tables if available
+            tables = getattr(file_content, 'tables', [])
+            if tables:
                 parsed_content["tables"] = []
                 table_texts = []
                 
-                for idx, table in enumerate(file_content.tables):
+                for idx, table in enumerate(tables):
                     table_data = {}
-                    
                     if hasattr(table, 'data') and table.data:
                         table_data["data"] = table.data
                         table_texts.append(f"Table {idx+1}:\n" + self._format_table_data(table.data))
                     
                     parsed_content["tables"].append(table_data)
                 
-                # 테이블 텍스트 추가
+                # Add table text to content if available
                 if table_texts:
-                    if parsed_content["content"]:
-                        parsed_content["content"] += "\n\n===== Tables =====\n" + "\n\n".join(table_texts)
-                    else:
-                        parsed_content["content"] = "===== Tables =====\n" + "\n\n".join(table_texts)
+                    table_section = "\n\n===== Tables =====\n" + "\n\n".join(table_texts)
+                    parsed_content["content"] = (parsed_content["content"] + table_section) if parsed_content["content"] else table_section
             
             return parsed_content
             
         except Exception as e:
             logging.error(f"Error downloading and parsing file {url}: {e}")
             return {"error": str(e), "filename": filename, "url": url}
+    
+    def _calculate_content_hash(self, file_bytes: Optional[bytes]) -> str:
+        """
+        Calculate a hash for file content
+        
+        Args:
+            file_bytes: File content as bytes
+            
+        Returns:
+            SHA-256 hash of file content as hexadecimal string
+        """
+        if not file_bytes:
+            logging.warning("Cannot calculate hash for empty content")
+            return ""
+            
+        try:
+            # Use SHA-256 for a good balance of speed and collision resistance
+            hash_obj = hashlib.sha256()
+            
+            # Process in chunks to handle large files more efficiently
+            chunk_size = 8192  # 8KB chunks
+            if isinstance(file_bytes, bytes):
+                # Process bytes directly if already in memory
+                for i in range(0, len(file_bytes), chunk_size):
+                    hash_obj.update(file_bytes[i:i+chunk_size])
+            else:
+                # Fallback for other types (shouldn't happen, but just in case)
+                logging.warning(f"Unexpected type for file_bytes: {type(file_bytes)}")
+                hash_obj.update(str(file_bytes).encode('utf-8', errors='ignore'))
+                
+            # Return the hexadecimal digest
+            return hash_obj.hexdigest()
+        except Exception as e:
+            logging.error(f"Error calculating content hash: {e}")
+            logging.debug(f"Error details: {traceback.format_exc()}")
+            return f"hash_error_{int(time.time())}"  # Return a timestamp-based placeholder
     
     def _parse_post(self, url: str, title: str, pid: str) -> List[Dict[str, Any]]:
         """

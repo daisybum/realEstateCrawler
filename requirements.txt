@@ -5,9 +5,13 @@ cloudscraper
 requests-html
 selenium
 webdriver-manager
+lxml
+lxml-html-clean
 
 # Progress and utilities
 tqdm
+fake-useragent
+psutil
 
 # Image processing
 opencv-python
@@ -37,3 +41,6 @@ numpy
 
 # JSON handling
 jsonlines
+
+# Testing
+# unittest.mock은 Python 표준 라이브러리의 일부입니다
