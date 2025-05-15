@@ -380,7 +380,7 @@ class Crawler:
     
     def _detect_downloadable_files(self, html_content: str) -> List[Dict[str, str]]:
         """
-        Detect downloadable files using the specified element
+        Detect downloadable files using DownloadDetector
         
         Args:
             html_content: HTML content of the page
@@ -388,115 +388,24 @@ class Crawler:
         Returns:
             List of dictionaries containing download information
         """
-        download_links = []
-        
         try:
-            # Method 1: Using BeautifulSoup to find the download span
+            # BeautifulSoup 객체 생성
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # 패턴 1: '다운로드' 텍스트가 있는 span 요소 찾기
-            download_spans = soup.find_all('span', class_='text-sm font-semibold', string='다운로드')
+            # DownloadDetector 클래스의 check_for_downloads_soup 메서드 활용
+            # 빈 문자열은 URL과 post ID 자리에 임시로 넣은 값
+            download_info = self.download_detector.check_for_downloads_soup(soup, "", "")
             
-            for span in download_spans:
-                # Navigate to parent elements to find the actual download link
-                parent_li = span.find_parent('li')
-                if parent_li:
-                    links = parent_li.find_all('a')
-                    for link in links:
-                        if link.get('href'):
-                            download_links.append({
-                                'href': link.get('href'),
-                                'text': link.get_text(strip=True) or '다운로드 파일'
-                            })
+            # 결과를 저장할 리스트
+            download_links = []
             
-            # 패턴 2: 파일 확장자가 포함된 링크 찾기
-            if not download_links:
-                for ext in SUPPORTED_EXTENSIONS:
-                    # 확장자가 포함된 href 속성을 가진 링크 찾기
-                    ext_links = soup.find_all('a', href=lambda href: href and ext.lower() in href.lower())
-                    for link in ext_links:
-                        # 제외할 패턴 확인
-                        exclude = False
-                        for pattern in EXCLUDE_PATTERNS:
-                            if pattern.lower() in link.get_text().lower() or pattern.lower() in link.get('href', '').lower():
-                                exclude = True
-                                break
-                        
-                        if not exclude:
-                            download_links.append({
-                                'href': link.get('href'),
-                                'text': link.get_text(strip=True) or f'다운로드 파일{ext}'
-                            })
-            
-            # 패턴 3: '첨부', '자료', '파일' 등의 키워드가 포함된 링크 찾기
-            if not download_links:
-                for keyword in DOWNLOAD_KEYWORDS:
-                    # 키워드가 포함된 텍스트를 가진 링크 찾기
-                    keyword_links = soup.find_all('a', string=lambda text: text and keyword in text)
-                    for link in keyword_links:
-                        if link.get('href') and not any(dl.get('href') == link.get('href') for dl in download_links):
-                            # 제외할 패턴 확인
-                            exclude = False
-                            for pattern in EXCLUDE_PATTERNS:
-                                if pattern.lower() in link.get_text().lower():
-                                    exclude = True
-                                    break
-                            
-                            if not exclude:
-                                download_links.append({
-                                    'href': link.get('href'),
-                                    'text': link.get_text(strip=True) or '다운로드 파일'
-                                })
-            
-            # 패턴 4: XPath를 사용한 다운로드 요소 찾기
-            if not download_links:
-                # Method 2: Using lxml's XPath
-                import lxml.html
-                tree = lxml.html.fromstring(html_content)
-                
-                # 다양한 XPath 패턴 시도
-                xpath_patterns = [
-                    '/html/body/div[1]/div[3]/div/div/section[1]/div[4]/ul/li/div/div[2]/span',
-                    '//span[contains(text(), "다운로드")]',
-                    '//a[contains(@href, ".pdf") or contains(@href, ".docx") or contains(@href, ".pptx")]',
-                    '//a[contains(text(), "첨부") or contains(text(), "자료") or contains(text(), "파일")]'
-                ]
-                
-                for xpath in xpath_patterns:
-                    elements = tree.xpath(xpath)
-                    
-                    for element in elements:
-                        # 링크 요소인 경우
-                        if element.tag == 'a' and element.get('href'):
-                            href = element.get('href')
-                            text = element.text_content().strip() if element.text_content() else '다운로드 파일'
-                            
-                            # 중복 확인
-                            if not any(dl.get('href') == href for dl in download_links):
-                                download_links.append({
-                                    'href': href,
-                                    'text': text
-                                })
-                        # 다른 요소인 경우 부모 요소에서 링크 찾기
-                        else:
-                            # Find parent li and then find links
-                            parent = element.getparent()
-                            while parent is not None and parent.tag != 'li':
-                                parent = parent.getparent()
-                            
-                            if parent is not None:
-                                links = parent.xpath('.//a')
-                                for link in links:
-                                    if link.get('href'):
-                                        href = link.get('href')
-                                        text = link.text_content().strip() if link.text_content() else '다운로드 파일'
-                                        
-                                        # 중복 확인
-                                        if not any(dl.get('href') == href for dl in download_links):
-                                            download_links.append({
-                                                'href': href,
-                                                'text': text
-                                            })
+            # DownloadInfo 객체에서 다운로드 링크 추출
+            if download_info and hasattr(download_info, 'download_links'):
+                for link in download_info.download_links:
+                    download_links.append({
+                        'href': link.get('url', ''),  # DownloadDetector에서는 'url'로 저장됨
+                        'text': link.get('text', '다운로드 파일')
+                    })
             
             # 결과에서 중복 제거
             unique_links = []
@@ -504,7 +413,7 @@ class Crawler:
             
             for link in download_links:
                 href = link.get('href')
-                if href not in seen_hrefs:
+                if href and href not in seen_hrefs:
                     seen_hrefs.add(href)
                     unique_links.append(link)
             
@@ -512,11 +421,11 @@ class Crawler:
             
         except Exception as e:
             logging.error(f"Error detecting downloadable files: {e}")
-            return download_links
+            return []
     
     def _download_and_parse_file(self, url: str, filename: str) -> Dict[str, Any]:
         """
-        Download and parse a file in-memory without saving to disk
+        Download and parse a file in-memory without saving to disk using the FileProcessor
         
         Args:
             url: URL of the file to download
@@ -534,87 +443,70 @@ class Crawler:
                 logging.warning(f"URL not allowed by robots.txt: {url}")
                 return {"error": "URL not allowed by robots.txt"}
             
-            # Download file in-memory
-            response = self.session.get(
-                url, 
-                headers={
-                    'User-Agent': self.config.user_agent,
-                    'Referer': self.config.base_url
-                },
-                stream=True,
-                timeout=self.config.request_timeout
-            )
-            response.raise_for_status()
-            
-            # Get file content as bytes
-            file_bytes = response.content
-            
-            # Determine file type from filename
+            # 파일 확장자 추출
             file_ext = os.path.splitext(filename)[1].lower()
             
-            # Parse file based on type using BytesIO (in-memory)
-            from io import BytesIO
-            file_obj = BytesIO(file_bytes)
+            # FileProcessor의 parse_file 메서드를 사용하여 파일 다운로드 및 파싱 수행
+            # post_id는 사용하지 않으므로 빈 문자열 전달
+            file_contents = self.file_processor.parse_file(url, "", filename)
             
-            # Import DocumentParser from parser directory
-            from src.parser.document_parser import DocumentParser
+            # 파싱 결과가 없는 경우 오류 반환
+            if not file_contents or len(file_contents) == 0:
+                return {"error": "Failed to parse file", "filename": filename, "url": url}
             
-            # Create document parser instance if not already created
-            if not hasattr(self, 'document_parser'):
-                self.document_parser = DocumentParser()
+            # 처리된 첫 번째 파일 콘텐츠 가져오기
+            file_content = file_contents[0]
             
-            # Use the document parser to parse the file bytes
-            parsed_content = {}
+            # 결과를 리턴할 데이터 구성
+            parsed_content = {
+                "filename": filename,
+                "url": url,
+                "content": file_content.text if hasattr(file_content, 'text') else "",
+                "metadata": file_content.metadata if hasattr(file_content, 'metadata') else {},
+                "file_type": file_content.file_type if hasattr(file_content, 'file_type') else os.path.splitext(filename)[1][1:]
+            }
             
-            # Create a temporary file to pass to the document parser
-            # This is needed because some parsers require a file path
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as temp_file:
-                temp_file.write(file_bytes)
-                temp_file_path = temp_file.name
-            
-            try:
-                # Parse the document using the appropriate parser based on file extension
-                parsed_result = self.document_parser.parse_document(temp_file_path)
-                
-                # Copy the parsed result to our output dictionary
-                parsed_content = parsed_result
-                
-                # Add filename and URL to the parsed content
-                parsed_content["filename"] = filename
-                parsed_content["url"] = url
-                
-            finally:
-                # Clean up the temporary file
-                try:
-                    os.unlink(temp_file_path)
-                except Exception as e:
-                    logging.warning(f"Failed to delete temporary file {temp_file_path}: {e}")
-            
-            # Process OCR text from images if available
-            if "images" in parsed_content and parsed_content["images"]:
+            # 이미지 처리
+            if hasattr(file_content, 'images') and file_content.images:
+                parsed_content["images"] = []
                 ocr_texts = []
-                for img in parsed_content["images"]:
-                    if "ocr_text" in img and img["ocr_text"].strip():
-                        ocr_texts.append(f"Image OCR: {img['ocr_text']}")
                 
+                for img in file_content.images:
+                    img_data = {}
+                    
+                    if hasattr(img, 'data'):
+                        img_data["data"] = img.data
+                    
+                    if hasattr(img, 'ocr_text') and img.ocr_text and img.ocr_text.strip():
+                        img_data["ocr_text"] = img.ocr_text
+                        ocr_texts.append(f"Image OCR: {img.ocr_text}")
+                    
+                    parsed_content["images"].append(img_data)
+                
+                # OCR 텍스트 추가
                 if ocr_texts:
-                    # Add OCR text to content
-                    if "content" in parsed_content:
+                    if parsed_content["content"]:
                         parsed_content["content"] += "\n\n===== OCR Text from Images =====\n" + "\n\n".join(ocr_texts)
                     else:
                         parsed_content["content"] = "===== OCR Text from Images =====\n" + "\n\n".join(ocr_texts)
             
-            # Process tables if available
-            if "tables" in parsed_content and parsed_content["tables"]:
+            # 테이블 처리
+            if hasattr(file_content, 'tables') and file_content.tables:
+                parsed_content["tables"] = []
                 table_texts = []
-                for idx, table in enumerate(parsed_content["tables"]):
-                    if "data" in table and table["data"]:
-                        table_texts.append(f"Table {idx+1}:\n" + self._format_table_data(table["data"]))
                 
+                for idx, table in enumerate(file_content.tables):
+                    table_data = {}
+                    
+                    if hasattr(table, 'data') and table.data:
+                        table_data["data"] = table.data
+                        table_texts.append(f"Table {idx+1}:\n" + self._format_table_data(table.data))
+                    
+                    parsed_content["tables"].append(table_data)
+                
+                # 테이블 텍스트 추가
                 if table_texts:
-                    # Add table text to content
-                    if "content" in parsed_content:
+                    if parsed_content["content"]:
                         parsed_content["content"] += "\n\n===== Tables =====\n" + "\n\n".join(table_texts)
                     else:
                         parsed_content["content"] = "===== Tables =====\n" + "\n\n".join(table_texts)
@@ -622,8 +514,8 @@ class Crawler:
             return parsed_content
             
         except Exception as e:
-            logging.error(f"Error downloading and parsing file: {e}")
-            return {"error": str(e)}
+            logging.error(f"Error downloading and parsing file {url}: {e}")
+            return {"error": str(e), "filename": filename, "url": url}
     
     def _parse_post(self, url: str, title: str, pid: str) -> List[Dict[str, Any]]:
         """
@@ -856,29 +748,21 @@ class Crawler:
                     # Remove UUID pattern
                     clean_text = uuid_pattern.sub('', link['text']).strip()
                     if clean_text:
+                        # DownloadDetector의 extract_file_extension 메서드를 활용하여 파일 확장자 추출
+                        # 링크 텍스트와 URL 모두 고려
+                        combined_text = clean_text + ' ' + download_url
+                        
                         # 파일 확장자가 이미 있는지 확인
                         if any(clean_text.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                             filename = clean_text
                         else:
-                            # URL 또는 링크 텍스트에서 파일 형식 추측
-                            ext_mapping = {
-                                'pdf': '.pdf',
-                                'pptx': '.pptx', 'ppt': '.pptx',
-                                'docx': '.docx', 'doc': '.docx',
-                                'xlsx': '.xlsx', 'xls': '.xlsx', 'excel': '.xlsx',
-                                'hwp': '.hwp'
-                            }
+                            # DownloadDetector의 extract_file_extension 메서드를 활용하여 파일 형식 추측
+                            ext = self.download_detector.extract_file_extension(combined_text)
                             
-                            # 링크 텍스트와 URL에서 파일 형식 키워드 찾기
-                            text_to_check = (download_url + ' ' + link.get('text', '')).lower()
-                            
-                            for keyword, extension in ext_mapping.items():
-                                if keyword in text_to_check:
-                                    filename = f"{clean_text}{extension}"
-                                    break
-                            
-                            # 기본값으로 PDF 사용
-                            if not filename:
+                            if ext:
+                                filename = f"{clean_text}.{ext}"
+                            else:
+                                # 기본값으로 PDF 사용
                                 filename = f"{clean_text}.pdf"
                 
                 # 2. Try to extract from URL
@@ -893,25 +777,16 @@ class Crawler:
                 if not filename and link.get('text'):
                     page_content = getattr(download_info, 'page_content', '').lower()
                     
-                    # 파일 형식 추론을 위한 매핑
-                    ext_mapping = {
-                        '.pdf': '.pdf',
-                        '.pptx': '.pptx', '.ppt': '.pptx',
-                        '.docx': '.docx', '.doc': '.docx',
-                        '.xlsx': '.xlsx', '.xls': '.xlsx',
-                        '.hwp': '.hwp'
-                    }
+                    # 링크 텍스트와 페이지 콘텐츠 모두 고려
+                    combined_text = link['text'] + ' ' + page_content
                     
-                    # 페이지 내용에서 파일 형식 키워드 찾기
-                    found_ext = False
-                    for keyword, extension in ext_mapping.items():
-                        if keyword in page_content:
-                            filename = f"{link['text']}{extension}"
-                            found_ext = True
-                            break
+                    # DownloadDetector의 extract_file_extension 메서드를 활용하여 파일 형식 추측
+                    ext = self.download_detector.extract_file_extension(combined_text)
                     
-                    # 기본값으로 PDF 사용
-                    if not found_ext:
+                    if ext:
+                        filename = f"{link['text']}.{ext}"
+                    else:
+                        # 기본값으로 PDF 사용
                         filename = f"{link['text']}.pdf"
                 
                 # 4. Use default if still no filename
