@@ -104,8 +104,8 @@ class Crawler:
         self.list_parser = ListParser(scraper=self.scraper)
         self.file_processor = FileProcessor(scraper=self.scraper)
         self.download_detector = DownloadDetector()
-        self.storage = JsonlStorage()
-        self.checkpoint_manager = CheckpointManager()
+        self.storage = JsonlStorage(config=self.config)
+        self.checkpoint_manager = CheckpointManager(config=self.config)
         
         # Authentication state
         self.auth_headers = None
@@ -1461,20 +1461,36 @@ class Crawler:
             Chrome webdriver instance
         """
         options = Options()
-        options.headless = Config.BROWSER_OPTIONS["headless"]
         
-        if Config.BROWSER_OPTIONS["disable_automation"]:
+        # Get browser options from config instance
+        browser_options = self.config.browser_options
+        
+        # Set headless mode
+        options.headless = browser_options.get("headless", False)
+        
+        # Add browser options
+        if browser_options.get("disable_automation", True):
             options.add_argument("--disable-blink-features=AutomationControlled")
         
-        if Config.BROWSER_OPTIONS["no_sandbox"]:
+        if browser_options.get("no_sandbox", True):
             options.add_argument("--no-sandbox")
             
-        if Config.BROWSER_OPTIONS["disable_shm"]:
+        if browser_options.get("disable_shm", True):
             options.add_argument("--disable-dev-shm-usage")
             
-        options.add_argument(f'user-agent={Config.USER_AGENT}')
+        # Add user agent
+        options.add_argument(f'user-agent={self.config.user_agent}')
         
-        return webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=options
-        )
+        # Additional options for better stability
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-notifications')
+        
+        try:
+            return webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options
+            )
+        except Exception as e:
+            logging.error(f"Failed to initialize WebDriver: {e}")
+            raise

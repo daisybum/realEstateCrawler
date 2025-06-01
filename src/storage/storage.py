@@ -16,14 +16,16 @@ from src.config import Config
 class JsonlStorage:
     """JSONL storage for post data"""
     
-    def __init__(self, filename: Path = None):
+    def __init__(self, filename: Path = None, config=None):
         """
         Initialize JSONL storage
         
         Args:
-            filename: Path to JSONL file (defaults to Config.OUT_JSONL)
+            filename: Path to JSONL file (defaults to config.out_jsonl)
+            config: Config instance (optional)
         """
-        self.filename = filename or Config.OUT_JSONL
+        self.config = config or Config.get_instance()
+        self.filename = filename or self.config.out_jsonl
     
     def save_posts(self, posts: List[Dict[str, Any]]) -> None:
         """
@@ -109,15 +111,17 @@ class JsonlStorage:
 class CheckpointManager:
     """Manages crawler checkpoints for resumable crawling"""
     
-    def __init__(self, filename: Path = None):
+    def __init__(self, filename: Path = None, config=None):
         """
         Initialize checkpoint manager
         
         Args:
-            filename: Path to checkpoint file (defaults to Config.CHECKPOINT_FILE)
+            filename: Path to checkpoint file (defaults to config.checkpoint_file)
+            config: Config instance (optional)
         """
-        self.filename = filename or Config.CHECKPOINT_FILE
-        self.jsonl_file = Config.OUT_JSONL
+        self.config = config or Config.get_instance()
+        self.filename = filename or self.config.checkpoint_file
+        self.jsonl_file = self.config.out_jsonl
     
     def save(self, page: int, download_summary: str) -> None:
         """
