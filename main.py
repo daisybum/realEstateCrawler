@@ -14,6 +14,7 @@ import os
 import logging
 import argparse
 from pathlib import Path
+from dotenv import load_dotenv
 from src.config import Config
 from src.crawler.crawler import Crawler
 
@@ -72,9 +73,24 @@ def main():
     # Configure logging
     setup_logging(args.debug)
     
+    # Load environment variables from .env.crawler
+    env_path = Path(__file__).parent / '.env.crawler'
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
+        logging.info(f"Loaded environment variables from {env_path}")
+    else:
+        logging.warning(f"No .env.crawler file found at {env_path}")
+    
     # Initialize configuration
     Config.initialize(args.config)
     config = Config.get_instance()
+    
+    # Debug: Print loaded credentials (don't log passwords in production)
+    if config.login_id:
+        logging.info(f"Loaded login ID: {config.login_id}")
+        logging.info("Login password: [REDACTED]")
+    else:
+        logging.warning("No login credentials found in environment variables")
     
     # Override configuration with command line arguments
     if args.output:
