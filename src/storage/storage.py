@@ -38,16 +38,36 @@ class JsonlStorage:
         existing_records = self._load_existing_records()
         
         # Filter out checkpoint records, keep only post records
-        post_records = [rec for rec in posts if "_checkpoint_page" not in rec and rec.get("post_id")]
+        post_records = [rec for rec in posts if "_checkpoint_page" not in rec and (rec.get("post_id") or rec.get("id"))]
         
         # Group and merge records by post_id
         posts_by_id = self._merge_records_by_id(post_records)
         
-        # Save only new records
+        # Ensure output directory exists
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save only new records with consistent field ordering
         with open(self.filename, "a", encoding="utf-8") as f:
-            for post_id, post in posts_by_id.items():
+            for post_id, post in sorted(posts_by_id.items()):
                 if post_id not in existing_records:
-                    f.write(json.dumps(post, ensure_ascii=False) + "\n")
+                    # Create a new dict with fields in consistent order
+                    ordered_post = {
+                        "post_id": post_id,
+                        "_download_summary": post.get("_download_summary", "[다운로드 없음] "),
+                        "src": post.get("src", ""),
+                        "title": post.get("title", ""),
+                        "type": post.get("type", "text_content"),
+                        "has_download": post.get("has_download", False),
+                        "file_formats": post.get("file_formats", []),
+                        "download_links": post.get("download_links", []),
+                        "content": post.get("content", "")
+                    }
+                    
+                    # Add error field if present
+                    if "error" in post:
+                        ordered_post["error"] = post["error"]
+                    
+                    f.write(json.dumps(ordered_post, ensure_ascii=False) + "\n")
     
     def _load_existing_records(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -71,39 +91,77 @@ class JsonlStorage:
     
     def _merge_records_by_id(self, records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
-        Merge records with the same post_id
+        Merge records with the same post_id and ensure consistent output format
         
         Args:
             records: List of post records
         
         Returns:
-            Dictionary of merged records by post_id
+            Dictionary of merged records by post_id with consistent format
         """
         posts_by_id = {}
+        
         for rec in records:
-            post_id = rec.get("post_id")
+            post_id = rec.get("post_id") or rec.get("id")
+            if not post_id:
+                continue
+                
             if post_id not in posts_by_id:
+                # Initialize with default values in the correct order
                 posts_by_id[post_id] = {
                     "post_id": post_id,
-                    "_download_summary": rec.get("_download_summary", "[다운로드 없음] "),
-                    "src": rec.get("src", ""),
-                    "title": rec.get("title", "")
+                    "_download_summary": "[다운로드 없음] ",
+                    "src": "",
+                    "title": "",
+                    "type": "text_content",
+                    "has_download": False,
+                    "file_formats": [],
+                    "download_links": [],
+                    "content": ""
                 }
             
-            # Add remaining fields, with special handling for certain types
-            for key, value in rec.items():
-                if key not in ["post_id", "src", "title", "_download_summary"]:
-                    # Download-related information
-                    if key in ["has_download", "file_formats", "download_links"]:
-                        posts_by_id[post_id][key] = value
-                    # Handle type field
-                    elif key == "type":
-                        if value == "download_info" and "_download_summary" in rec:
-                            posts_by_id[post_id]["_download_summary"] = rec["_download_summary"]
-                        posts_by_id[post_id]["type"] = value
-                    # All other fields
-                    else:
-                        posts_by_id[post_id][key] = value
+            # Update fields from current record, preserving the original structure
+            current_post = posts_by_id[post_id]
+            
+            # Handle URL/source
+            if "src" in rec and rec["src"]:
+                current_post["src"] = rec["src"]
+            elif "url" in rec and rec["url"]:
+                current_post["src"] = rec["url"]
+            
+            # Handle title
+            if "title" in rec and rec["title"]:
+                current_post["title"] = rec["title"]
+            
+            # Handle content
+            if "content" in rec and rec["content"]:
+                current_post["content"] = rec["content"]
+            
+            # Handle download information
+            if "_download_summary" in rec:
+                current_post["_download_summary"] = rec["_download_summary"]
+            
+            if "has_download" in rec:
+                current_post["has_download"] = rec["has_download"]
+            
+            if "file_formats" in rec and rec["file_formats"]:
+                current_post["file_formats"] = list(set(current_post["file_formats"] + rec["file_formats"]))
+            
+            if "download_links" in rec and rec["download_links"]:
+                # Merge download links, avoiding duplicates
+                existing_urls = {link.get("url") for link in current_post["download_links"]}
+                for link in rec["download_links"]:
+                    if isinstance(link, dict) and link.get("url") and link["url"] not in existing_urls:
+                        current_post["download_links"].append(link)
+            
+            # Handle type (pdf_extract, pptx_extract, text_content, error)
+            if "type" in rec and rec["type"]:
+                current_post["type"] = rec["type"]
+            
+            # Handle errors
+            if "error" in rec and rec["error"]:
+                current_post["error"] = rec["error"]
+                current_post["type"] = "error"
         
         return posts_by_id
 

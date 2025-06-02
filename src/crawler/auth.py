@@ -301,6 +301,10 @@ class Authenticator:
             if not self._is_logged_in_browser():
                 raise AuthenticationError("Browser login verification failed")
             
+            # Navigate to community list page after successful login
+            self.driver.get(self.config.specific_list_url)
+            time.sleep(self.config.wait_page_load)
+            
             # Extract cookies and apply to session
             cookies = self.driver.get_cookies()
             headers = {"User-Agent": self.config.user_agent}
@@ -309,7 +313,7 @@ class Authenticator:
                 self.session.cookies.set(cookie['name'], cookie['value'])
                 self.scraper.cookies.set(cookie['name'], cookie['value'])
                 
-            logging.info("Browser login successful")
+            logging.info("Browser login successful and navigated to community list")
             return headers, self.driver
             
         except Exception as e:
