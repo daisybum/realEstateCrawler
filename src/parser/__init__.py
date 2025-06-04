@@ -4,13 +4,13 @@
 Parser module for Real Estate Crawler
 """
 
-from src.parser.pdf_parser import PDFParser
-from src.parser.pptx_parser import PPTXParser
-from src.parser.docx_parser import DOCXParser
-from src.parser.document_parser import DocumentParser
-from src.parser.parser import ContentParser, ListParser
+from src.parser.parser_pdf import PDFParser
+from src.parser.parser_pptx import PPTXParser
+from src.parser.parser_docx import DOCXParser
+from src.parser.parser_document import DocumentParser
+from src.parser.parser import ContentParser
 
 __all__ = [
     'PDFParser', 'PPTXParser', 'DOCXParser', 'DocumentParser',
-    'ContentParser', 'ListParser'
+    'ContentParser'
 ]
