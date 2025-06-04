@@ -3,17 +3,23 @@
 """
 Download detector for real estate crawler
 """
+
 import re
 import logging
-import os
 from typing import List, Dict, Any, Optional
-from urllib.parse import urljoin
+from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
-import lxml.html
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
-from src.models.models import DownloadInfo
+
+@dataclass
+class DownloadInfo:
+    """다운로드 정보를 담는 클래스"""
+    has_download: bool = False
+    file_formats: List[str] = field(default_factory=list)
+    download_links: List[Dict[str, str]] = field(default_factory=list)
+
 
 class DownloadDetector:
     """Class for detecting downloadable files in HTML content"""
@@ -61,7 +67,16 @@ class DownloadDetector:
             'xlsx': 'xlsx', 'xls': 'xlsx', 'excel': 'xlsx', '엑셀': 'xlsx',
             'hwp': 'hwp', '한글': 'hwp'
         }
-    
+        
+        # 인증서 PDF 필터링을 위한 패턴
+        self.certificate_patterns = [
+            '원격평생교육원:(제 원-639호)',
+            '원격평생교육원',
+            'certificate',
+            '인증서',
+            '증명서'
+        ]
+        
     def detect_downloads(self, html_content: str) -> List[Dict[str, Any]]:
         """
         Detect downloadable files in HTML content
@@ -87,56 +102,91 @@ class DownloadDetector:
         """
         downloads = []
         
-        # CSS 선택자를 사용하여 다운로드 링크 찾기
+        # 1. CSS 선택자로 다운로드 링크 찾기
         for selector in self.download_selectors:
             try:
-                for link in soup.select(selector):
-                    if not link.get('href'):
+                # BeautifulSoup의 CSS 선택자 기능은 제한적이므로 일부 선택자는 건너뛰기
+                if ':contains(' in selector:
+                    continue
+                    
+                links = soup.select(selector)
+                for link in links:
+                    href = link.get('href')
+                    text = link.get_text(strip=True)
+                    
+                    if not href:
                         continue
                         
-                    download_info = {
-                        'url': link.get('href'),
-                        'text': link.get_text(strip=True),
-                        'element': 'a',
-                        'method': 'css',
-                        'page_content': str(soup)
-                    }
-                    
-                    if download_info not in downloads:
-                        downloads.append(download_info)
+                    # 인증서 PDF 파일 무시
+                    if self._is_certificate_pdf(href, text):
+                        continue
+                        
+                    # 이미 추가된 링크인지 확인
+                    if any(d.get('url') == href for d in downloads):
+                        continue
+                        
+                    downloads.append({
+                        'url': href,
+                        'text': text or href.split('/')[-1]
+                    })
             except Exception as e:
-                logging.warning(f"Error finding downloads with selector {selector}: {e}")
+                logging.debug(f"Error with CSS selector {selector}: {e}")
         
-        # XPath를 사용하여 다운로드 링크 찾기
+        # 2. XPath 패턴으로 다운로드 링크 찾기 (lxml 사용)
         try:
-            html_tree = lxml.html.fromstring(str(soup))
+            from lxml import etree
+            html = etree.HTML(str(soup))
             
             for xpath in self.xpath_patterns:
                 try:
-                    elements = html_tree.xpath(xpath)
-                    
+                    elements = html.xpath(xpath)
                     for element in elements:
                         href = element.get('href')
+                        text = ''.join(element.xpath('.//text()'))
+                        
                         if not href:
                             continue
                             
-                        download_info = {
+                        # 인증서 PDF 파일 무시
+                        if self._is_certificate_pdf(href, text):
+                            continue
+                            
+                        # 이미 추가된 링크인지 확인
+                        if any(d.get('url') == href for d in downloads):
+                            continue
+                            
+                        downloads.append({
                             'url': href,
-                            'text': element.text_content().strip() if element.text_content() else '',
-                            'element': 'a',
-                            'method': 'xpath',
-                            'page_content': str(soup)
-                        }
-                        
-                        if download_info not in downloads:
-                            downloads.append(download_info)
+                            'text': text.strip() or href.split('/')[-1]
+                        })
                 except Exception as e:
-                    logging.warning(f"Error finding downloads with XPath {xpath}: {e}")
-        except Exception as e:
-            logging.warning(f"Error parsing HTML for XPath: {e}")
+                    logging.debug(f"Error with XPath pattern {xpath}: {e}")
+        except ImportError:
+            logging.debug("lxml not installed, skipping XPath patterns")
         
         return downloads
     
+    def _is_certificate_pdf(self, url: str, text: str) -> bool:
+        """
+        Check if the URL or text refers to a certificate PDF
+        
+        Args:
+            url: URL to check
+            text: Text to check
+            
+        Returns:
+            True if it's a certificate PDF, False otherwise
+        """
+        url_lower = url.lower()
+        text_lower = text.lower()
+        
+        # 인증서 PDF 파일 필터링
+        for pattern in self.certificate_patterns:
+            if pattern.lower() in url_lower or pattern.lower() in text_lower:
+                return True
+                
+        return False
+        
     def extract_file_extension(self, text: str) -> str:
         """
         Extract file extension from text
@@ -163,6 +213,63 @@ class DownloadDetector:
                 return ext
         
         return ""
+    
+    def check_content_for_file_references(self, content: str, pid: str) -> DownloadInfo:
+        """
+        Check post content text for file references
+        
+        Args:
+            content: Post content text
+            pid: Post ID
+            
+        Returns:
+            DownloadInfo object with detected files
+        """
+        result = DownloadInfo()
+        
+        if not content:
+            return result
+            
+        # 파일 확장자 패턴 (더 정확한 파일명 패턴)
+        file_pattern = re.compile(r'([가-힣a-zA-Z0-9_\-\[\]\(\)]+\.(pdf|pptx?|docx?|hwp|xlsx?|xls))', re.IGNORECASE)
+        matches = file_pattern.findall(content)
+        
+        for filename, ext in matches:
+            # 인증서 PDF 파일 무시
+            if self._is_certificate_pdf("", filename):
+                logging.info(f"[페이지 {pid}] 인증서 PDF 파일 무시: {filename}")
+                continue
+                
+            result.has_download = True
+            
+            # 파일 형식 추가
+            file_type = ext.lower()
+            if file_type.startswith("ppt"):
+                file_type = "pptx"
+            elif file_type.startswith("doc"):
+                file_type = "docx"
+            elif file_type.startswith("xls"):
+                file_type = "xlsx"
+                
+            if file_type not in result.file_formats:
+                result.file_formats.append(file_type)
+            
+            # 링크 추가 (이미 있는지 확인)
+            synthetic_url = f"https://weolbu.com/api/download/{pid}/{filename}"
+            found = False
+            for link_info in result.download_links:
+                if link_info.get("url") == synthetic_url:
+                    found = True
+                    break
+                    
+            if not found:
+                result.download_links.append({
+                    "url": synthetic_url,
+                    "text": filename
+                })
+                logging.info(f"[페이지 {pid}] 콘텐츠에서 파일 참조 발견: {filename}")
+                
+        return result
         
     def check_for_downloads_browser(self, driver: webdriver.Chrome, url: str, pid: str) -> DownloadInfo:
         """
@@ -179,13 +286,27 @@ class DownloadDetector:
         result = DownloadInfo()
         
         try:
-            # 1. Find download buttons
+            # 1. 가장 먼저 특정 다운로드 버튼 찾기 (<span class="text-sm font-semibold">다운로드</span>)
+            specific_download_spans = driver.find_elements(By.XPATH, "//span[@class='text-sm font-semibold' and contains(text(), '다운로드')]")
+            if specific_download_spans:
+                logging.info(f"[페이지 {pid}] 특정 다운로드 버튼 발견: <span class='text-sm font-semibold'>다운로드</span>")
+                result.has_download = True
+            
+            # 2. 일반 다운로드 버튼 찾기
             download_buttons = driver.find_elements(By.XPATH, "//span[contains(text(), '다운로드')]") + \
                               driver.find_elements(By.XPATH, "//a[contains(text(), '다운로드')]") + \
                               driver.find_elements(By.XPATH, "//button[contains(text(), '다운로드')]") + \
                               driver.find_elements(By.XPATH, "//div[contains(text(), '다운로드')]")
             
-            # 2. Find links with file extensions or file-related text
+            # 다운로드 버튼이 있으면 다운로드 있음으로 표시
+            if download_buttons:
+                result.has_download = True
+                for button in download_buttons:
+                    button_text = button.text.strip()
+                    if button_text:
+                        logging.info(f"[페이지 {pid}] 다운로드 버튼 발견: {button_text}")
+            
+            # 3. 파일 링크 찾기
             file_links = driver.find_elements(By.XPATH, 
                 "//a[contains(@href, '.pptx') or contains(@href, '.pdf') or contains(@href, '.docx') or \
                 contains(@href, '.hwp') or contains(@href, '.doc') or contains(@href, '.xlsx') or \
@@ -193,14 +314,47 @@ class DownloadDetector:
                 contains(text(), 'PPT') or contains(text(), 'doc') or contains(text(), 'DOC') or \
                 contains(text(), 'hwp') or contains(text(), 'HWP') or \
                 contains(@download, 'pdf') or contains(@title, 'pdf')]") 
-                
-            # Also find generic download buttons that might be files
+            
+            # 일반 다운로드 링크도 추가
             download_buttons_links = driver.find_elements(By.XPATH, "//a[contains(text(), '다운로드') or contains(text(), 'download')]") 
             file_links.extend(download_buttons_links)
             
-            # 2.5 직접 페이지 소스에서 파일명 패턴 찾기 (예: 월부_서울기초반_가형_임장보고서탬플릿_1주차.pdf)
+            # 파일 링크 처리
+            for link in file_links:
+                href = link.get_attribute("href")
+                link_text = link.text.strip()
+                
+                if not href and not link_text:
+                    continue
+                    
+                # 인증서 PDF 파일 무시
+                if href and self._is_certificate_pdf(href, link_text or ""):
+                    logging.info(f"[페이지 {pid}] 인증서 PDF 파일 무시: {link_text or href}")
+                    continue
+                    
+                result.has_download = True
+                
+                # 파일 형식 추출 및 추가
+                file_ext = self.extract_file_extension(href or link_text or "")
+                if file_ext and file_ext not in result.file_formats:
+                    result.file_formats.append(file_ext)
+                
+                # 링크 추가 (이미 있는지 확인)
+                found = False
+                for link_info in result.download_links:
+                    if href and link_info.get("url") == href:
+                        found = True
+                        break
+                        
+                if not found and href:
+                    result.download_links.append({
+                        "url": href,
+                        "text": link_text or "Download"
+                    })
+                    logging.info(f"[페이지 {pid}] 다운로드 링크 추가: {link_text or href}")
+            
+            # 4. 페이지 소스에서 파일명 패턴 찾기
             page_source = driver.page_source
-            # 파일명 패턴 정의
             filename_pattern = re.compile(r"([가-힣a-zA-Z0-9_\-\[\]\(\)]+\.(pdf|pptx?|docx?|hwp|xlsx?))", re.IGNORECASE)
             filename_matches = filename_pattern.findall(page_source)
             
@@ -210,9 +364,13 @@ class DownloadDetector:
                 context_end = min(len(page_source), page_source.find(filename) + len(filename) + 50)
                 context = page_source[context_start:context_end].lower()
                 
-                # 다운로드 관련 단어가 주변에 있거나 <span class="text-sm font-semibold">다운로드</span> 패턴이 있는지 확인
-                if "다운로드" in context or "download" in context or "첨부파일" in context or \
-                   '<span class="text-sm font-semibold">다운로드</span>' in page_source:
+                # 다운로드 관련 단어가 주변에 있는지 확인
+                if "다운로드" in context or "download" in context or "첨부파일" in context:
+                    # 인증서 PDF 파일 무시
+                    if self._is_certificate_pdf("", filename):
+                        logging.info(f"[페이지 {pid}] 인증서 PDF 파일 무시: {filename}")
+                        continue
+                        
                     result.has_download = True
                     
                     # 파일 형식 추가
@@ -242,58 +400,36 @@ class DownloadDetector:
                         })
                         logging.info(f"[페이지 {pid}] 파일명 패턴 기반 다운로드 링크 추가: {filename}")
             
-            # 3. Process download buttons
-            for button in download_buttons:
-                button_text = button.text.strip()
-                if button_text:
-                    result.has_download = True
-                    logging.info(f"[페이지 {pid}] 다운로드 버튼 발견: {button_text}")
+            # 5. 페이지 텍스트 콘텐츠에서 파일 참조 찾기 (새로 추가된 부분)
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+            content_result = self.check_content_for_file_references(page_text, pid)
             
-            # 4. Process file links
-            for link in file_links:
-                href = link.get_attribute("href")
-                link_text = link.text.strip()
-                
-                if not href and not link_text:
-                    continue
-                    
+            # 결과 병합
+            if content_result.has_download:
                 result.has_download = True
                 
-                # 파일 형식 추출
-                file_type = ""
-                if href:
-                    if ".pdf" in href.lower() or "pdf" in link_text.lower():
-                        file_type = "pdf"
-                    elif any(ext in href.lower() for ext in [".pptx", ".ppt"]) or any(kw in link_text.lower() for kw in ["ppt", "pptx", "프레젠테이션"]):
-                        file_type = "pptx"
-                    elif any(ext in href.lower() for ext in [".docx", ".doc"]) or any(kw in link_text.lower() for kw in ["doc", "docx", "워드"]):
-                        file_type = "docx"
-                    elif ".hwp" in href.lower() or "hwp" in link_text.lower() or "한글" in link_text.lower():
-                        file_type = "hwp"
-                    elif any(ext in href.lower() for ext in [".xlsx", ".xls"]) or any(kw in link_text.lower() for kw in ["xls", "xlsx", "엑셀"]):
-                        file_type = "xlsx"
-                    else:
-                        # 기본값으로 PDF 가정
-                        file_type = "pdf"
+                # 파일 형식 병합
+                for file_format in content_result.file_formats:
+                    if file_format not in result.file_formats:
+                        result.file_formats.append(file_format)
                 
-                if file_type and file_type not in result.file_formats:
-                    result.file_formats.append(file_type)
-                
-                # 링크 추가 (이미 있는지 확인)
-                if href:
+                # 다운로드 링크 병합
+                for link in content_result.download_links:
                     found = False
-                    for link_info in result.download_links:
-                        if link_info.get("url") == href:
+                    for existing_link in result.download_links:
+                        if existing_link.get("url") == link.get("url"):
                             found = True
                             break
-                            
+                    
                     if not found:
-                        result.download_links.append({
-                            "url": href,
-                            "text": link_text or "Download"
-                        })
-                        logging.info(f"[페이지 {pid}] 다운로드 링크 추가: {link_text or href}")
+                        result.download_links.append(link)
             
+            # 다운로드 있음/없음 로직 정리
+            if result.has_download:
+                logging.info(f"[페이지 {pid}] 다운로드 있음 처리 완료")
+            else:
+                logging.info(f"[페이지 {pid}] 다운로드 없음")
+                
             return result
             
         except Exception as e:
