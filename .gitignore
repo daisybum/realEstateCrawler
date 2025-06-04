@@ -49,6 +49,12 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+
+# Test results
+*_results.json
+
+# Backup files
+*.bak
 cover/
 
 # Translations
@@ -221,3 +227,4 @@ checkpoint.json
 .windsurfrules
 scripts/task-complexity-report.json
 tasks/ 
+data/
