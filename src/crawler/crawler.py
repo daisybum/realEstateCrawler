@@ -27,6 +27,7 @@ from selenium.webdriver.chrome.options import Options
 
 from src.config import Config
 from src.crawler.auth import Authenticator
+from src.crawler.download_detector import DownloadDetector
 
 class CrawlerError(Exception):
     """Base exception for crawler errors"""
@@ -45,6 +46,7 @@ class Crawler:
         self.driver = None
         self.auth_headers = None
         self.visited_urls = set()
+        self.download_detector = DownloadDetector()
         
         # Configure logging
         logging.basicConfig(
@@ -252,25 +254,172 @@ class Crawler:
                     self.driver.get(direct_url)
                     time.sleep(3)  # Wait for page to load
             
-            # Extract post content
+            # Initialize post data
             post_data = {
                 'id': post_id,
                 'url': url,
-                'title': self.driver.title,
-                'content': self.driver.find_element(By.CSS_SELECTOR, '.post-content').text if self.driver.find_elements(By.CSS_SELECTOR, '.post-content') else '',
-                'author': self.driver.find_element(By.CSS_SELECTOR, '.author').text if self.driver.find_elements(By.CSS_SELECTOR, '.author') else '',
-                'created_at': self.driver.find_element(By.CSS_SELECTOR, '.created-at').get_attribute('datetime') if self.driver.find_elements(By.CSS_SELECTOR, '.created-at') else '',
+                'title': '',
+                'content': '',
+                'author': '',
+                'created_at': '',
                 'attachments': []
             }
             
-            # Extract attachments
-            for attachment in self.driver.find_elements(By.CSS_SELECTOR, '.attachment a'):
-                attachment_url = attachment.get_attribute('href')
-                if attachment_url:
-                    post_data['attachments'].append({
-                        'url': urljoin(self.config.base_url, attachment_url) if not attachment_url.startswith('http') else attachment_url,
-                        'filename': attachment.text.strip() or attachment_url.split('/')[-1]
-                    })
+            # Extract title from page title or specific element
+            try:
+                post_data['title'] = self.driver.title.replace(' : 월급쟁이부자들', '').strip()
+                # Try to get a more specific title if available
+                title_elements = self.driver.find_elements(By.CSS_SELECTOR, '.post-title, .view-title, h1.title, .board-title')
+                if title_elements:
+                    post_data['title'] = title_elements[0].text.strip()
+            except Exception as e:
+                self.logger.warning(f"Error extracting title: {e}")
+            
+            # Extract content using multiple selectors
+            content_found = False
+            content_selectors = [
+                ".post-content", ".view-content", ".content", "article", ".fr-view", ".fr-element",
+                "#post-content", "#view-content", "#content", ".viewer_content", ".board-content"
+            ]
+            
+            for selector in content_selectors:
+                try:
+                    content_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if content_elements:
+                        for element in content_elements:
+                            text = element.text.strip()
+                            if text and len(text) > 50:  # Only extract meaningful text
+                                self.logger.info(f"Found content using selector: {selector} ({len(text)} chars)")
+                                post_data['content'] = text
+                                content_found = True
+                                break
+                    if content_found:
+                        break
+                except Exception as e:
+                    self.logger.debug(f"Error with selector {selector}: {e}")
+            
+            # If no content found, try getting body text
+            if not content_found:
+                try:
+                    body_text = self.driver.find_element(By.TAG_NAME, "body").text
+                    # Filter out navigation and other UI text
+                    lines = body_text.split('\n')
+                    content_lines = []
+                    in_content = False
+                    
+                    for line in lines:
+                        # Skip short lines that are likely UI elements
+                        if len(line.strip()) < 5:
+                            continue
+                        # Skip navigation and header lines
+                        if any(x in line.lower() for x in ['로그인', '회원가입', '메뉴', '검색', '홈', '마이페이지']):
+                            continue
+                        # Likely in content area if line is long enough
+                        if len(line.strip()) > 30:
+                            in_content = True
+                        if in_content:
+                            content_lines.append(line)
+                    
+                    if content_lines:
+                        post_data['content'] = '\n'.join(content_lines)
+                        self.logger.info(f"Extracted content from body text: {len(post_data['content'])} chars")
+                except Exception as e:
+                    self.logger.warning(f"Error extracting body text: {e}")
+            
+            # Extract author and date if available
+            try:
+                author_elements = self.driver.find_elements(By.CSS_SELECTOR, '.author, .writer, .user-info')
+                if author_elements:
+                    post_data['author'] = author_elements[0].text.strip()
+                
+                date_elements = self.driver.find_elements(By.CSS_SELECTOR, '.date, .created-at, .post-date, .write-date')
+                if date_elements:
+                    post_data['created_at'] = date_elements[0].text.strip()
+            except Exception as e:
+                self.logger.debug(f"Error extracting author/date: {e}")
+            
+            # Use DownloadDetector to find attachments and download links
+            try:
+                # First check for downloads using the browser
+                download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
+                
+                # Also check the post content text directly for file references
+                if post_data['content'] and not download_info.has_download:
+                    self.logger.info(f"Checking post content text for file references: {post_id}")
+                    content_download_info = self.download_detector.check_content_for_file_references(post_data['content'], post_id)
+                    
+                    # Merge results if content analysis found downloads
+                    if content_download_info.has_download:
+                        download_info.has_download = True
+                        
+                        # Merge file formats
+                        for file_format in content_download_info.file_formats:
+                            if file_format not in download_info.file_formats:
+                                download_info.file_formats.append(file_format)
+                        
+                        # Merge download links
+                        for link in content_download_info.download_links:
+                            found = False
+                            for existing_link in download_info.download_links:
+                                if existing_link.get("url") == link.get("url"):
+                                    found = True
+                                    break
+                            
+                            if not found:
+                                download_info.download_links.append(link)
+                
+                # Add detected downloads to post data
+                if download_info.has_download:
+                    self.logger.info(f"Found downloads in post {post_id}: {len(download_info.download_links)} links, formats: {download_info.file_formats}")
+                    for link in download_info.download_links:
+                        attachment_url = link.get('url')
+                        filename = link.get('text') or attachment_url.split('/')[-1]
+                        
+                        if attachment_url and not any(a['url'] == attachment_url for a in post_data['attachments']):
+                            post_data['attachments'].append({
+                                'url': urljoin(self.config.base_url, attachment_url) if not attachment_url.startswith('http') else attachment_url,
+                                'filename': filename
+                            })
+            except Exception as e:
+                self.logger.debug(f"Error detecting downloads: {e}")
+            
+            # Extract images
+            try:
+                image_selectors = [".post-content img", ".view-content img", ".content img", "article img", ".fr-view img"]
+                for selector in image_selectors:
+                    images = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for img in images:
+                        try:
+                            src = img.get_attribute("src")
+                            if src and not src.startswith("data:") and not src.endswith(".svg"):
+                                img_url = src if src.startswith("http") else urljoin(self.config.base_url, src)
+                                # Add image URL to content for reference
+                                if img_url and img_url not in post_data['content']:
+                                    post_data['content'] += f"\n\n[이미지: {img_url}]"
+                        except Exception as img_err:
+                            self.logger.debug(f"Error processing image: {img_err}")
+            except Exception as e:
+                self.logger.debug(f"Error extracting images: {e}")
+            
+            # If still no content found, try BeautifulSoup parsing
+            if not post_data['content']:
+                try:
+                    from bs4 import BeautifulSoup
+                    html_content = self.driver.page_source
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # Try to find content divs
+                    for div in soup.find_all("div", class_=True):
+                        class_name = div.get("class", [])
+                        if class_name:
+                            class_str = " ".join(class_name)
+                            text = div.get_text(strip=True)
+                            if text and len(text) > 100 and ("content" in class_str.lower() or "post" in class_str.lower() or "view" in class_str.lower()):
+                                self.logger.info(f"Found content via BeautifulSoup: div.{class_str}")
+                                post_data['content'] = text
+                                break
+                except Exception as soup_err:
+                    self.logger.warning(f"BeautifulSoup parsing error: {soup_err}")
             
             return post_data
             
