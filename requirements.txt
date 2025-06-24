@@ -1,46 +1,46 @@
 # Web scraping and networking
-requests
-beautifulsoup4
-cloudscraper
-requests-html
-selenium
-webdriver-manager
-lxml
-lxml-html-clean
+requests==2.32.3
+beautifulsoup4==4.13.4
+cloudscraper==1.2.71
+requests-html==0.10.0
+selenium==4.32.0
+webdriver-manager==4.0.2
+lxml==5.4.0
+lxml-html-clean==0.4.2
 
 # Progress and utilities
-tqdm
-fake-useragent
-psutil
+tqdm==4.67.1
+fake-useragent==2.2.0
+psutil==7.0.0
 
 # Image processing
-opencv-python
-opencv-python-headless
-Pillow
+opencv-python==4.11.0.86
+opencv-python-headless==4.11.0.86
+Pillow==11.2.1
 
 # OCR and document processing
-paddleocr
-paddlepaddle
-pytesseract
+paddleocr==2.10.0
+paddlepaddle==3.0.0
+pytesseract==0.3.13
 
 # Document parsing
-python-pptx
-camelot-py
-ghostscript
-pdf2image
-pypdf2
-pymupdf
-pdfplumber
-docling
-docling-core
-pypdfium2
+python-pptx==1.0.2
+camelot-py==1.0.0
+ghostscript==0.7
+pdf2image==1.17.0
+PyPDF2==3.0.1
+PyMuPDF==1.25.5
+pdfplumber==0.11.6
+docling==2.32.0
+docling-core==2.30.1
+pypdfium2==4.30.1
 
 # Data handling
-pandas
-numpy
+pandas==2.2.3
+numpy==2.2.5
 
 # JSON handling
-jsonlines
+jsonlines==3.1.0
 
 # Testing
 # unittest.mock은 Python 표준 라이브러리의 일부입니다
