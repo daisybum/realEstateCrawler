@@ -7,6 +7,7 @@
 1) REST API → 실패 시 2) Headless 렌더링(Fallback)
 2) 첨부파일(pdf/pptx/docx) 있으면 파일만, 없으면 본문·이미지 OCR
 3) JSONL 체크포인트 저장
+4) 크롤링 오케스트레이션 및 JSONL 내보내기
 ──────────────────────────────────────────────────────────────
 """
 
@@ -17,6 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from src.config import Config
 from src.crawler.crawler import Crawler
+from src.storage.storage import JsonlStorage, CheckpointManager
 
 
 def parse_arguments():
@@ -40,6 +42,23 @@ def parse_arguments():
     parser.add_argument(
         "--debug", 
         help="Enable debug logging", 
+        action="store_true"
+    )
+    parser.add_argument(
+        "--start-page",
+        help="Start crawling from this page number",
+        type=int,
+        default=None
+    )
+    parser.add_argument(
+        "--max-pages",
+        help="Maximum number of pages to crawl",
+        type=int,
+        default=None
+    )
+    parser.add_argument(
+        "--export-only",
+        help="Only export existing data without crawling",
         action="store_true"
     )
     return parser.parse_args()
@@ -100,20 +119,51 @@ def main():
         config._config_loader.set('browser_headless', True)
     
     # Ensure directories exist
-    Config.ensure_directories()
+    config.ensure_directories()
     
     # Log configuration
     logging.info(f"Starting crawler with output directory: {config.output_dir}")
     logging.info(f"JSONL output file: {config.out_jsonl}")
     logging.info(f"Checkpoint file: {config.checkpoint_file}")
     
-    # Create and run crawler
     try:
-        crawler = Crawler()
-        crawler.crawl()
+        # Initialize checkpoint manager
+        checkpoint = CheckpointManager()
         
-        # Print completion message
-        print(f"✅ 완료 → {config.out_jsonl.resolve()}")
+        if args.export_only:
+            # Export only mode - just process existing data
+            logging.info("Export-only mode: processing existing data")
+            storage = JsonlStorage()
+            last_page = checkpoint.get_last_page()
+            logging.info(f"Last processed page from checkpoint: {last_page}")
+            print(f"✅ 내보내기 완료 → {config.out_jsonl.resolve()}")
+        else:
+            # Full crawling mode with Crawler
+            crawler = Crawler(config)
+            
+            # Set crawling parameters
+            start_page = args.start_page or checkpoint.get_last_page()
+            max_pages = args.max_pages
+            
+            # Start crawling
+            logging.info(f"Starting crawl from page {start_page}")
+            stats = crawler.crawl(start_page=start_page, max_pages=max_pages)
+            
+            # Print completion message
+            print(f"✅ 크롤링 완료 → {config.out_jsonl.resolve()}")
+            if hasattr(stats, 'get'):
+                print(f"   - 처리된 페이지: {stats.get('pages_processed', 'N/A')}")
+                print(f"   - 처리된 포스트: {stats.get('posts_processed', 'N/A')}")
+                print(f"   - 다운로드 포스트: {stats.get('posts_with_downloads', 'N/A')}")
+                print(f"   - 처리된 파일: {stats.get('files_processed', 'N/A')}")
+                print(f"   - 오류: {stats.get('errors', 'N/A')}")
+            else:
+                print("   - 크롤링 완료 (상세 통계 없음)")
+                print(f"   - 마지막 페이지: {checkpoint.get_last_page()}")
+                print(f"   - 출력 파일: {config.out_jsonl}")
+                print(f"   - 체크포인트: {config.checkpoint_file}")
+                print(f"   - 출력 디렉토리: {config.output_dir}")
+                print(f"   - 다운로드 디렉토리: {config.download_dir}")
     except Exception as e:
         logging.error(f"Error during crawling: {e}", exc_info=True)
         print(f"❌ 오류 발생: {e}")

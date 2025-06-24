@@ -7,6 +7,8 @@ File processing utilities for real estate crawler
 import os
 import logging
 import re
+import time
+import requests
 from typing import List, Dict, Any
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from io import BytesIO
@@ -16,10 +18,10 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 from src.models.models import FileContent, DownloadInfo
-from src.parser.document_parser import DocumentParser
-from src.parser.pdf_parser import PDFParser
-from src.parser.pptx_parser import PPTXParser
-from src.parser.docx_parser import DOCXParser
+from src.parser.parser_document import DocumentParser
+from src.parser.parser_pdf import PDFParser
+from src.parser.parser_pptx import PPTXParser
+from src.parser.parser_docx import DOCXParser
 
 
 class FileProcessor:
@@ -156,6 +158,65 @@ class FileProcessor:
                 logging.error(f"파일 처리 오류 ({file_ext}): {e}")
         
         return []
+    
+    def download_file(self, url: str, post_id: str, filename: str = "") -> str:
+        """
+        Download a file from URL and save it to the downloads directory
+        
+        Args:
+            url: URL of the file to download
+            post_id: Post ID for organizing downloads
+            filename: Optional filename (will be extracted from URL if not provided)
+            
+        Returns:
+            Path to the downloaded file or empty string if download failed
+        """
+        if not url:
+            logging.error("Empty URL provided for download")
+            return ""
+            
+        try:
+            # Extract filename from URL if not provided
+            if not filename:
+                parsed_url = urlparse(url)
+                filename = os.path.basename(parsed_url.path)
+                if not filename or filename.endswith('/'):
+                    # Generate a filename based on post_id and file extension
+                    ext = self.extract_file_extension(url) or "pdf"
+                    filename = f"file_{post_id}_{int(time.time())}.{ext}"
+            
+            # Create download directory structure
+            download_dir = os.path.join(os.getcwd(), "downloads", post_id)
+            os.makedirs(download_dir, exist_ok=True)
+            
+            # Full path for the downloaded file
+            file_path = os.path.join(download_dir, filename)
+            
+            # Check if file already exists
+            if os.path.exists(file_path):
+                logging.info(f"File already exists: {file_path}")
+                return file_path
+            
+            # Download the file
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            
+            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            # Save the file
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            logging.info(f"Downloaded file: {file_path}")
+            return file_path
+            
+        except Exception as e:
+            logging.error(f"Error downloading file from {url}: {e}")
+            return ""
     
     # 불필요한 _parse_pdf 메서드 제거됨
     

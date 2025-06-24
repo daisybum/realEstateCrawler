@@ -11,7 +11,8 @@ import logging
 import hashlib
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Set
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional, Set, Union
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -28,6 +29,9 @@ from selenium.webdriver.chrome.options import Options
 from src.config import Config
 from src.crawler.auth import Authenticator
 from src.crawler.download_detector import DownloadDetector
+from src.storage.storage import JsonlStorage, CheckpointManager
+from src.storage.file_processor import FileProcessor
+from src.parser.parser_document import DocumentParser
 
 class CrawlerError(Exception):
     """Base exception for crawler errors"""
@@ -504,14 +508,39 @@ class Crawler:
             self.logger.error(f"Error loading checkpoint: {e}")
         return 1
     
-    def crawl(self) -> None:
-        """Main crawling method that handles pagination and post processing"""
+    def crawl(self, start_page: int = None, max_pages: int = None) -> Dict[str, Any]:
+        """Main crawling method that handles pagination and post processing
+        
+        Args:
+            start_page: Optional starting page number (defaults to checkpoint)
+            max_pages: Optional maximum number of pages to crawl
+            
+        Returns:
+            Dictionary with crawling statistics
+        """
+        # Initialize statistics
+        stats = {
+            'pages_processed': 0,
+            'posts_processed': 0,
+            'posts_with_downloads': 0,
+            'files_processed': 0,
+            'errors': 0
+        }
+        
+        # Initialize storage and processors
+        storage = JsonlStorage(filename=self.config.out_jsonl)
+        checkpoint_manager = CheckpointManager(filename=self.config.checkpoint_file)
+        file_processor = FileProcessor(scraper=self.session)
+        document_parser = DocumentParser()
+        
         try:
             # Ensure authenticated
             self.auth_headers, self.driver = self.ensure_authenticated()
             
-            # Load checkpoint
-            start_page = self._load_checkpoint()
+            # Load checkpoint if start_page not specified
+            if start_page is None:
+                start_page = checkpoint_manager.get_last_page() or 1
+            
             self.logger.info(f"Starting from page {start_page}")
             
             page = start_page
@@ -519,6 +548,11 @@ class Crawler:
             pbar = tqdm(desc="Page", initial=page-1)
             
             while True:
+                # Check if we've reached max_pages
+                if max_pages and stats['pages_processed'] >= max_pages:
+                    self.logger.info(f"Reached maximum pages limit ({max_pages})")
+                    break
+                    
                 try:
                     self.logger.info(f"Processing page {page}...")
                     
@@ -536,50 +570,100 @@ class Crawler:
                             
                             # Create a record with the post data
                             result = {
+                                'post_id': post_id,
                                 'title': title,
-                                'url': url,
-                                'data': post_data,
-                                'crawled_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                                'src': url,
+                                'author': post_data.get('author', ''),
+                                'date': post_data.get('date', ''),
+                                'content': post_data.get('content', ''),
+                                'crawl_timestamp': datetime.now().isoformat(),
+                                'has_download': False,
+                                'file_formats': []
                             }
                             
-                            # Get download summary if available
+                            # Process attachments if available
                             download_summary = "[다운로드 없음] "
+                            file_formats = set()
+                            file_sources = []
+                            parsed_content = ""
+                            
                             if post_data.get('attachments'):
-                                file_formats = set()
                                 for attachment in post_data['attachments']:
-                                    url = attachment.get('url', '')
-                                    if '.' in url:
-                                        fmt = url.split('.')[-1].lower()
+                                    attachment_url = attachment.get('url', '')
+                                    if not attachment_url:
+                                        continue
+                                        
+                                    # Extract file format
+                                    if '.' in attachment_url:
+                                        fmt = attachment_url.split('.')[-1].lower()
                                         if fmt in ['pdf', 'pptx', 'docx', 'xlsx']:
                                             file_formats.add(fmt)
+                                            
+                                    # Download and process the file
+                                    try:
+                                        downloaded_file = file_processor.download_file(
+                                            url=attachment_url,
+                                            post_id=post_id,
+                                            filename=attachment.get('filename', '')
+                                        )
+                                        
+                                        if downloaded_file:
+                                            file_sources.append(attachment_url)
+                                            
+                                            # Parse document content if it's a supported format
+                                            doc_content = document_parser.parse_document(downloaded_file)
+                                            if doc_content:
+                                                parsed_content += doc_content + "\n\n"
+                                                
+                                    except Exception as e:
+                                        self.logger.error(f"Error downloading file {attachment_url}: {e}")
+                                        stats['errors'] += 1
                                 
+                                # Update result with download information
                                 if file_formats:
+                                    result['has_download'] = True
+                                    result['file_formats'] = list(file_formats)
                                     download_summary = f"[다운로드 가능: {', '.join(file_formats)}] "
+                                    stats['posts_with_downloads'] += 1
+                                    stats['files_processed'] += len(file_sources)
+                            
+                            # Add parsed content if available
+                            if parsed_content:
+                                result['parsed_content'] = parsed_content.strip()
                             
                             # Save checkpoint with download summary
-                            self._save_checkpoint(page, download_summary)
+                            checkpoint_manager.save_checkpoint(page, download_summary)
                             
-                            # Save the result
-                            self._save_results([result])
+                            # Save the result to JSONL storage
+                            storage.save_posts([result])
+                            
+                            # Update statistics
+                            stats['posts_processed'] += 1
                             
                         except Exception as e:
                             self.logger.error(f"Error processing post {url}: {e}")
+                            stats['errors'] += 1
                     
                     # Move to next page
                     page += 1
+                    stats['pages_processed'] += 1
                     pbar.update(1)
                     time.sleep(1)  # polite delay
                     
                 except Exception as e:
                     self.logger.error(f"Error processing page {page}: {e}")
+                    stats['errors'] += 1
                     # Wait before retry
                     time.sleep(5)
             
             pbar.close()
             self.logger.info("Crawling completed successfully")
+            self.logger.info(f"Statistics: {stats}")
+            return stats
             
         except Exception as e:
             self.logger.error(f"Fatal error during crawling: {e}", exc_info=True)
+            stats['errors'] += 1
             raise
         finally:
             # Close browser when done
