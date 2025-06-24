@@ -228,3 +228,6 @@ checkpoint.json
 scripts/task-complexity-report.json
 tasks/ 
 data/
+# Ignore sensitive env files
+.env
+.env.crawler
