@@ -18,6 +18,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 from src.models.models import FileContent, DownloadInfo
+from src.config import Config
 from src.parser.parser_document import DocumentParser
 from src.parser.parser_pdf import PDFParser
 from src.parser.parser_pptx import PPTXParser
@@ -176,6 +177,8 @@ class FileProcessor:
             return ""
             
         try:
+            # Choose HTTP client (authenticated session if available)
+            http_client = self.scraper if self.scraper is not None else requests
             # Extract filename from URL if not provided
             if not filename:
                 parsed_url = urlparse(url)
@@ -185,8 +188,10 @@ class FileProcessor:
                     ext = self.extract_file_extension(url) or "pdf"
                     filename = f"file_{post_id}_{int(time.time())}.{ext}"
             
-            # Create download directory structure
-            download_dir = os.path.join(os.getcwd(), "downloads", post_id)
+            # Create download directory structure based on Config settings
+            config = Config.get_instance()
+            download_root = str(config.download_dir)
+            download_dir = os.path.join(download_root, post_id)
             os.makedirs(download_dir, exist_ok=True)
             
             # Full path for the downloaded file
@@ -202,7 +207,7 @@ class FileProcessor:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
             
-            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            response = http_client.get(url, headers=headers, stream=True, timeout=30)
             response.raise_for_status()
             
             # Save the file

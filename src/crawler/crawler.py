@@ -336,9 +336,16 @@ class Crawler:
                 if author_elements:
                     post_data['author'] = author_elements[0].text.strip()
                 
-                date_elements = self.driver.find_elements(By.CSS_SELECTOR, '.date, .created-at, .post-date, .write-date')
+                date_elements = self.driver.find_elements(By.CSS_SELECTOR, '.date, .created-at, .post-date, .write-date, li[title]')
                 if date_elements:
-                    post_data['created_at'] = date_elements[0].text.strip()
+                    # Prefer title attribute if present and matches full datetime
+                    for elem in date_elements:
+                        title_attr = elem.get_attribute('title')
+                        if title_attr and re.match(r'^\d{4}-\d{2}-\d{2}', title_attr):
+                            post_data['created_at'] = title_attr.strip()
+                            break
+                    if not post_data['created_at']:
+                        post_data['created_at'] = date_elements[0].text.strip()
             except Exception as e:
                 self.logger.debug(f"Error extracting author/date: {e}")
             
@@ -425,6 +432,11 @@ class Crawler:
                 except Exception as soup_err:
                     self.logger.warning(f"BeautifulSoup parsing error: {soup_err}")
             
+            # Detect old-style yy.mm.dd date only on the post's date label
+            post_data['date_limit_reached'] = False
+            created = post_data.get('created_at', '')
+            if created and re.match(r"^\d{2}\.\d{2}\.\d{2}$", created.strip()):
+                post_data['date_limit_reached'] = True
             return post_data
             
         except Exception as e:
@@ -527,19 +539,22 @@ class Crawler:
             'errors': 0
         }
         
-        # Initialize storage and processors
-        storage = JsonlStorage(filename=self.config.out_jsonl)
-        checkpoint_manager = CheckpointManager(filename=self.config.checkpoint_file)
-        file_processor = FileProcessor(scraper=self.session)
-        document_parser = DocumentParser()
+        # Download-only mode: disable persistent storage and checkpointing
+        class _NoOpStorage:
+            def save_posts(self, posts):
+                pass
+        storage = _NoOpStorage()
+        # Use authenticator session (with cookies) for HTTP downloads
+        file_processor = FileProcessor(scraper=self.authenticator.session)
+        document_parser = None  # Parser disabled in download-only mode
         
         try:
             # Ensure authenticated
             self.auth_headers, self.driver = self.ensure_authenticated()
             
-            # Load checkpoint if start_page not specified
+            # Determine starting page (checkpoint disabled in download-only mode)
             if start_page is None:
-                start_page = checkpoint_manager.get_last_page() or 1
+                start_page = 1
             
             self.logger.info(f"Starting from page {start_page}")
             
@@ -567,6 +582,8 @@ class Crawler:
                             self.logger.info(f"Processing post: {title}")
                             post_id = url.split('/')[-1]
                             post_data = self._process_post(url)
+                            # Flag set inside _process_post when date pattern detected
+                            date_limit_flag = post_data.pop('date_limit_reached', False)
                             
                             # Create a record with the post data
                             result = {
@@ -588,6 +605,13 @@ class Crawler:
                             parsed_content = ""
                             
                             if post_data.get('attachments'):
+                                # Sync Selenium cookies → HTTP session to ensure authenticated downloads
+                                try:
+                                    if self.driver and hasattr(file_processor, 'scraper') and file_processor.scraper:
+                                        for cookie in self.driver.get_cookies():
+                                            file_processor.scraper.cookies.set(cookie['name'], cookie['value'])
+                                except Exception:
+                                    pass
                                 for attachment in post_data['attachments']:
                                     attachment_url = attachment.get('url', '')
                                     if not attachment_url:
@@ -609,11 +633,6 @@ class Crawler:
                                         
                                         if downloaded_file:
                                             file_sources.append(attachment_url)
-                                            
-                                            # Parse document content if it's a supported format
-                                            doc_content = document_parser.parse_document(downloaded_file)
-                                            if doc_content:
-                                                parsed_content += doc_content + "\n\n"
                                                 
                                     except Exception as e:
                                         self.logger.error(f"Error downloading file {attachment_url}: {e}")
@@ -630,16 +649,18 @@ class Crawler:
                             # Add parsed content if available
                             if parsed_content:
                                 result['parsed_content'] = parsed_content.strip()
-                            
-                            # Save checkpoint with download summary
-                            checkpoint_manager.save_checkpoint(page, download_summary)
-                            
-                            # Save the result to JSONL storage
-                            storage.save_posts([result])
+                           
                             
                             # Update statistics
                             stats['posts_processed'] += 1
                             
+                            # Stop crawling if date limit pattern found in this post (after downloads)
+                            if date_limit_flag:
+                                raise StopIteration("Date limit reached; stopping crawl after downloads")
+                            
+                        except StopIteration as stop_exc:
+                            # Propagate to outer loop to stop crawl gracefully
+                            raise stop_exc
                         except Exception as e:
                             self.logger.error(f"Error processing post {url}: {e}")
                             stats['errors'] += 1
@@ -650,6 +671,9 @@ class Crawler:
                     pbar.update(1)
                     time.sleep(1)  # polite delay
                     
+                except StopIteration as stop_exc:
+                    self.logger.info(str(stop_exc))
+                    break
                 except Exception as e:
                     self.logger.error(f"Error processing page {page}: {e}")
                     stats['errors'] += 1

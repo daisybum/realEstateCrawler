@@ -18,7 +18,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import WebDriverException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 
 from src.config import Config
@@ -275,9 +275,16 @@ class Authenticator:
             self.driver.get(self.config.specific_list_url)
             time.sleep(self.config.wait_page_load)
             
-            # Click login button
-            login_button = self.driver.find_element(By.CSS_SELECTOR, 
-                "button.inline-flex.items-center.justify-center.whitespace-nowrap.rounded-md.transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-1.focus-visible\\:ring-ring.disabled\\:pointer-events-none.disabled\\:opacity-50.hover\\:bg-accent.hover\\:text-accent-foreground.h-10\\.5.w-10\\.5.cursor-pointer.border-none.bg-transparent.bg-none.bg-auto.p-1.px-0.font-semibold.text-\\[\\#222222\\].no-underline.text-sm")
+            # Click login button (try by visible text '로그인')
+            try:
+                login_button = self.driver.find_element(By.XPATH, "//button[contains(text(), '로그인') or contains(., '로그인')]")
+            except NoSuchElementException:
+                try:
+                    login_button = self.driver.find_element(By.XPATH, "//a[contains(text(), '로그인') or contains(., '로그인')]")
+                except NoSuchElementException:
+                    # Fallback to original CSS selector if still not found
+                    login_button = self.driver.find_element(By.CSS_SELECTOR,
+                        "button.inline-flex.items-center.justify-center.whitespace-nowrap.rounded-md.transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-1.focus-visible\\:ring-ring.disabled\\:pointer-events-none.disabled\\:opacity-50.hover\\:bg-accent.hover\\:text-accent-foreground.h-10\\.5.w-10\\.5.cursor-pointer.border-none.bg-transparent.bg-none.bg-auto.p-1.px-0.font-semibold.text-\\[\\#222222\\].no-underline.text-sm")
             self.driver.execute_script("arguments[0].click();", login_button)
             time.sleep(self.config.wait_page_load)
             
@@ -382,6 +389,9 @@ class Authenticator:
         """
         options = Options()
         options.headless = self.config.browser_options["headless"]
+        # Enable performance logging for Network events
+        perf_prefs = {"performance": "ALL"}
+        options.set_capability('goog:loggingPrefs', perf_prefs)
         
         if self.config.browser_options["disable_automation"]:
             options.add_argument("--disable-blink-features=AutomationControlled")

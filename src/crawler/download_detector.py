@@ -6,6 +6,7 @@ Download detector for real estate crawler
 
 import re
 import logging
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
@@ -254,20 +255,16 @@ class DownloadDetector:
             if file_type not in result.file_formats:
                 result.file_formats.append(file_type)
             
-            # 링크 추가 (이미 있는지 확인)
-            synthetic_url = f"https://weolbu.com/api/download/{pid}/{filename}"
-            found = False
-            for link_info in result.download_links:
-                if link_info.get("url") == synthetic_url:
-                    found = True
-                    break
-                    
-            if not found:
+            # CDN 직접 링크 추가
+            cdn_url_pattern = r"https?://cdn\.weolbu\.com/([a-zA-Z0-9_\-]+/)?([가-힣a-zA-Z0-9_\-\[\]\(\)]+\.(pdf|pptx?|docx?|hwp|xlsx?|xls))"
+            cdn_match = re.search(cdn_url_pattern, content)
+            if cdn_match:
+                cdn_url = cdn_match.group(0)
                 result.download_links.append({
-                    "url": synthetic_url,
+                    "url": cdn_url,
                     "text": filename
                 })
-                logging.info(f"[페이지 {pid}] 콘텐츠에서 파일 참조 발견: {filename}")
+                logging.info(f"[페이지 {pid}] CDN 직접 링크 추가: {cdn_url}")
                 
         return result
         
@@ -298,13 +295,48 @@ class DownloadDetector:
                               driver.find_elements(By.XPATH, "//button[contains(text(), '다운로드')]") + \
                               driver.find_elements(By.XPATH, "//div[contains(text(), '다운로드')]")
             
-            # 다운로드 버튼이 있으면 다운로드 있음으로 표시
+            # 다운로드 버튼이 있으면 다운로드 있음으로 표시 및 실제 링크 추출 시도
             if download_buttons:
                 result.has_download = True
                 for button in download_buttons:
                     button_text = button.text.strip()
                     if button_text:
                         logging.info(f"[페이지 {pid}] 다운로드 버튼 발견: {button_text}")
+                    # 버튼 클릭 시도 (스크립트로) – 일부 페이지에서 a 태그가 동적 생성됨
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                        driver.execute_script("arguments[0].click();", button)
+                        time.sleep(1)
+                    except Exception as click_err:
+                        logging.debug(f"[페이지 {pid}] 다운로드 버튼 클릭 실패: {click_err}")
+                # 1차: 클릭 이후 DOM 에 CDN 링크가 생겼는지 확인
+                anchor_elements = driver.find_elements(By.XPATH, "//a[contains(@href,'cdn.weolbu.com') and (contains(@href,'.pdf') or contains(@href,'.ppt') or contains(@href,'.doc') or contains(@href,'.hwp') or contains(@href,'.xls'))]")
+                for a in anchor_elements:
+                    href = a.get_attribute('href')
+                    link_text = a.text.strip() or href.split('/')[-1]
+                    if href and not self._is_certificate_pdf(href, link_text) and not any(link_info.get('url') == href for link_info in result.download_links):
+                        result.download_links.append({'url': href, 'text': link_text})
+                        file_ext = self.extract_file_extension(href)
+                        if file_ext and file_ext not in result.file_formats:
+                            result.file_formats.append(file_ext)
+                        logging.info(f"[페이지 {pid}] 클릭 후 CDN 링크 발견(DOM): {href}")
+                # 2차: 네트워크 로그에서 CDN 요청 추출
+                try:
+                    import json
+                    perf_logs = driver.get_log('performance')
+                    for entry in perf_logs:
+                        msg = json.loads(entry.get('message', '{}')).get('message', {})
+                        if msg.get('method') == 'Network.requestWillBeSent':
+                            req_url = msg.get('params', {}).get('request', {}).get('url', '')
+                            if 'cdn.weolbu.com' in req_url and re.search(r'\.(pdf|pptx?|docx?|hwp|xlsx?)', req_url, re.IGNORECASE):
+                                if not self._is_certificate_pdf(req_url, '') and not any(link_info.get('url') == req_url for link_info in result.download_links):
+                                    result.download_links.append({'url': req_url, 'text': req_url.split('/')[-1]})
+                                    file_ext = self.extract_file_extension(req_url)
+                                    if file_ext and file_ext not in result.file_formats:
+                                        result.file_formats.append(file_ext)
+                                    logging.info(f"[페이지 {pid}] 클릭 후 CDN 링크 발견(Net): {req_url}")
+                except Exception as log_err:
+                    logging.debug(f"[페이지 {pid}] 퍼포먼스 로그 파싱 오류: {log_err}")
             
             # 3. 파일 링크 찾기
             file_links = driver.find_elements(By.XPATH, 
@@ -339,19 +371,13 @@ class DownloadDetector:
                 if file_ext and file_ext not in result.file_formats:
                     result.file_formats.append(file_ext)
                 
-                # 링크 추가 (이미 있는지 확인)
-                found = False
-                for link_info in result.download_links:
-                    if href and link_info.get("url") == href:
-                        found = True
-                        break
-                        
-                if not found and href:
+                # 링크 추가 (중복 방지)
+                if href and not any(link_info.get('url') == href for link_info in result.download_links):
                     result.download_links.append({
-                        "url": href,
-                        "text": link_text or "Download"
+                        'url': href,
+                        'text': link_text or href.split('/')[-1]
                     })
-                    logging.info(f"[페이지 {pid}] 다운로드 링크 추가: {link_text or href}")
+                    logging.info(f"[페이지 {pid}] 다운로드 링크 추가: {href}")
             
             # 4. 페이지 소스에서 파일명 패턴 찾기
             page_source = driver.page_source
@@ -385,20 +411,16 @@ class DownloadDetector:
                     if file_type not in result.file_formats:
                         result.file_formats.append(file_type)
                     
-                    # 링크 추가 (이미 있는지 확인)
-                    synthetic_url = f"https://weolbu.com/api/download/{pid}/{filename}"
-                    found = False
-                    for link_info in result.download_links:
-                        if link_info.get("url") == synthetic_url:
-                            found = True
-                            break
-                            
-                    if not found:
+                    # CDN 직접 링크 추가
+                    cdn_url_pattern = r"https?://cdn\.weolbu\.com/([a-zA-Z0-9_\-]+/)?([가-힣a-zA-Z0-9_\-\[\]\(\)]+\.(pdf|pptx?|docx?|hwp|xlsx?|xls))"
+                    cdn_match = re.search(cdn_url_pattern, page_source)
+                    if cdn_match:
+                        cdn_url = cdn_match.group(0)
                         result.download_links.append({
-                            "url": synthetic_url,
+                            "url": cdn_url,
                             "text": filename
                         })
-                        logging.info(f"[페이지 {pid}] 파일명 패턴 기반 다운로드 링크 추가: {filename}")
+                        logging.info(f"[페이지 {pid}] CDN 직접 링크 추가: {cdn_url}")
             
             # 5. 페이지 텍스트 콘텐츠에서 파일 참조 찾기 (새로 추가된 부분)
             page_text = driver.find_element(By.TAG_NAME, "body").text
