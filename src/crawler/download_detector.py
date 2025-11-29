@@ -302,13 +302,13 @@ class DownloadDetector:
                     button_text = button.text.strip()
                     if button_text:
                         logging.info(f"[페이지 {pid}] 다운로드 버튼 발견: {button_text}")
-                    # 버튼 클릭 시도 (스크립트로) – 일부 페이지에서 a 태그가 동적 생성됨
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView(true);", button)
-                        driver.execute_script("arguments[0].click();", button)
-                        time.sleep(1)
-                    except Exception as click_err:
-                        logging.debug(f"[페이지 {pid}] 다운로드 버튼 클릭 실패: {click_err}")
+                    # 버튼 클릭 시도 제거 - 브라우저 다운로드 트리거 방지
+                    # try:
+                    #     driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                    #     driver.execute_script("arguments[0].click();", button)
+                    #     time.sleep(1)
+                    # except Exception as click_err:
+                    #     logging.debug(f"[페이지 {pid}] 다운로드 버튼 클릭 실패: {click_err}")
                 # 1차: 클릭 이후 DOM 에 CDN 링크가 생겼는지 확인
                 anchor_elements = driver.find_elements(By.XPATH, "//a[contains(@href,'cdn.weolbu.com') and (contains(@href,'.pdf') or contains(@href,'.ppt') or contains(@href,'.doc') or contains(@href,'.hwp') or contains(@href,'.xls'))]")
                 for a in anchor_elements:
