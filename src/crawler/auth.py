@@ -7,18 +7,17 @@ Authentication module for real estate crawler
 import time
 import logging
 import random
-import re
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional, Any, Union
+from datetime import datetime
+from typing import Dict, Tuple, Optional
 
 import requests
-import cloudscraper
-from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import WebDriverException, NoSuchElementException
+from selenium.common.exceptions import WebDriverException, NoSuchElementException, TimeoutException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 from src.config import Config
@@ -34,32 +33,52 @@ class SessionExpiredError(AuthenticationError):
     pass
 
 
-class CSRFTokenError(AuthenticationError):
-    """Exception raised when CSRF token cannot be extracted"""
-    pass
+class AuthSelectors:
+    """CSS/XPath selectors for authentication"""
+    LOGIN_BUTTON_TEXT_XPATH = "//button[contains(text(), '로그인') or contains(., '로그인')]"
+    LOGIN_LINK_TEXT_XPATH = "//a[contains(text(), '로그인') or contains(., '로그인')]"
+    LOGIN_BUTTON_CSS = (
+        "button.inline-flex.items-center.justify-center.whitespace-nowrap.rounded-md"
+        ".transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-1"
+        ".focus-visible\\:ring-ring.disabled\\:pointer-events-none.disabled\\:opacity-50"
+        ".hover\\:bg-accent.hover\\:text-accent-foreground.h-10\\.5.w-10\\.5.cursor-pointer"
+        ".border-none.bg-transparent.bg-none.bg-auto.p-1.px-0.font-semibold"
+        ".text-\\[\\#222222\\].no-underline.text-sm"
+    )
+    EMAIL_INPUT = "input[placeholder='이메일 또는 아이디']"
+    PASSWORD_INPUT = "input[type='password']"
+    SUBMIT_BUTTON_XPATH = "//form//button[contains(., '로그인')]"
+    SUBMIT_BUTTON_FALLBACK_XPATH = "//form/div/div[contains(@class, 'flex')]/button"
+
+
+class AuthIndicators:
+    """Strings indicating login status"""
+    LOGOUT = "로그아웃"
+    MY_PAGE = "마이페이지"
+    PROFILE = "프로필"
+    URL_MYPAGE = "mypage"
+    URL_DASHBOARD = "dashboard"
 
 
 class Authenticator:
     """Handles login and authentication for the crawler"""
     
-    def __init__(self, config=None):
+    def __init__(self, config: Optional[Config] = None):
         """Initialize authenticator with configuration"""
         self.config = config or Config.get_instance()
         self.session = requests.Session()
-        self.scraper = cloudscraper.create_scraper()
-        self.driver = None
+        self.driver: Optional[webdriver.Chrome] = None
         
         # Authentication state
-        self.csrf_token = None
-        self.auth_headers = {"User-Agent": self.config.user_agent}
-        self.last_auth_time = None
-        self.auth_method = None  # 'api' or 'browser'
+        self.auth_headers: Dict[str, str] = {"User-Agent": self.config.user_agent}
+        self.last_auth_time: Optional[datetime] = None
         self.max_retries = 3
         self.session_timeout = 1800  # 30 minutes in seconds
+        self.logger = logging.getLogger(__name__)
     
     def login(self) -> Tuple[Dict[str, str], Optional[webdriver.Chrome]]:
         """
-        Handle login process, first with API, then fallback to browser
+        Handle login process using browser automation
         
         Returns:
             Tuple of (auth_headers, webdriver) for subsequent requests
@@ -67,35 +86,25 @@ class Authenticator:
         Raises:
             AuthenticationError: If all login attempts fail
         """
-        logging.info("Starting login process")
+        self.logger.info("Starting login process")
         
-        # Try API login first
         for attempt in range(1, self.max_retries + 1):
             try:
-                # Try API login
-                auth_headers = self._api_login()
-                if auth_headers:
-                    self.auth_headers = auth_headers
-                    self.last_auth_time = datetime.now()
-                    self.auth_method = 'api'
-                    return self.auth_headers, None
-                
-                # Fall back to browser login if API fails
+                # Browser login
                 headers, driver = self._browser_login()
                 if headers:
                     self.auth_headers = headers
                     self.last_auth_time = datetime.now()
-                    self.auth_method = 'browser'
                     return self.auth_headers, driver
                     
             except (AuthenticationError, WebDriverException) as e:
-                logging.error(f"Login attempt {attempt} failed: {e}")
+                self.logger.error(f"Login attempt {attempt} failed: {e}")
                 if attempt == self.max_retries:
                     raise AuthenticationError(f"All login attempts failed: {e}")
                 
                 # Exponential backoff with jitter
                 backoff_time = (2 ** attempt) + random.uniform(0, 1)
-                logging.info(f"Retrying in {backoff_time:.2f} seconds...")
+                self.logger.info(f"Retrying in {backoff_time:.2f} seconds...")
                 time.sleep(backoff_time)
         
         raise AuthenticationError("Login failed after multiple attempts")
@@ -108,148 +117,11 @@ class Authenticator:
             Tuple of (auth_headers, webdriver) for subsequent requests
         """
         if self._needs_reauth():
-            logging.info("Session expired or not authenticated, re-authenticating...")
+            self.logger.info("Session expired or not authenticated, re-authenticating...")
             return self.login()
         
-        logging.debug("Session is still valid")
+        self.logger.debug("Session is still valid")
         return self.auth_headers, self.driver
-    
-    def _api_login(self) -> Optional[Dict[str, str]]:
-        """
-        Attempt login via API
-        
-        Returns:
-            Authentication headers if successful, None otherwise
-            
-        Raises:
-            AuthenticationError: If login fails due to invalid credentials
-        """
-        logging.info("Attempting API login")
-        
-        # Get CSRF token if needed
-        if not self.csrf_token:
-            try:
-                self._extract_csrf_token_from_api()
-            except CSRFTokenError as e:
-                logging.warning(f"Could not extract CSRF token: {e}")
-                # Continue without CSRF token, some APIs don't require it
-        
-        # Prepare login data
-        login_data = {
-            "email": self.config.login_id,
-            "password": self.config.login_pw
-        }
-        
-        # Add CSRF token if available
-        if self.csrf_token:
-            login_data["csrf_token"] = self.csrf_token
-        
-        # Set up headers
-        headers = {
-            "User-Agent": self.config.user_agent,
-            "Content-Type": "application/json",
-            "Referer": self.config.base_url
-        }
-        
-        try:
-            # Attempt login
-            r = self.scraper.post(
-                self.config.login_url, 
-                json=login_data,
-                headers=headers,
-                timeout=self.config.request_timeout
-            )
-            
-            # Check for successful login
-            if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
-                resp = r.json()
-                if "accessToken" in resp:
-                    token = resp["accessToken"]
-                    logging.info("API login successful")
-                    
-                    # Update session cookies
-                    self.session.cookies.update(self.scraper.cookies)
-                    
-                    return {
-                        "User-Agent": self.config.user_agent,
-                        "Authorization": f"Bearer {token}"
-                    }
-            
-            # Check for specific error messages
-            if r.status_code == 401 or r.status_code == 403:
-                error_msg = "Invalid credentials" if r.status_code == 401 else "Access forbidden"
-                if r.headers.get("content-type", "").startswith("application/json"):
-                    try:
-                        error_data = r.json()
-                        error_msg = error_data.get("message", error_msg)
-                    except Exception:
-                        pass
-                raise AuthenticationError(f"API login failed: {error_msg}")
-            
-            logging.warning(f"API login failed with status code {r.status_code}")
-            return None
-            
-        except requests.RequestException as e:
-            logging.error(f"API login request failed: {e}")
-            return None
-    
-    def _extract_csrf_token_from_api(self) -> Optional[str]:
-        """
-        Extract CSRF token from login page via API
-        
-        Returns:
-            CSRF token if found, None otherwise
-            
-        Raises:
-            CSRFTokenError: If CSRF token cannot be extracted
-        """
-        try:
-            r = self.scraper.get(
-                self.config.login_url,
-                headers={"User-Agent": self.config.user_agent},
-                timeout=self.config.request_timeout
-            )
-            
-            if r.status_code == 200:
-                # Try to find CSRF token in HTML
-                soup = BeautifulSoup(r.text, 'html.parser')
-                
-                # Look for common CSRF token patterns
-                csrf_selectors = [
-                    "input[name='csrf_token']", 
-                    "input[name='_csrf_token']",
-                    "input[name='_token']",
-                    "meta[name='csrf-token']"
-                ]
-                
-                for selector in csrf_selectors:
-                    token_elem = soup.select_one(selector)
-                    if token_elem:
-                        if token_elem.name == 'input':
-                            self.csrf_token = token_elem.get('value')
-                        elif token_elem.name == 'meta':
-                            self.csrf_token = token_elem.get('content')
-                        
-                        if self.csrf_token:
-                            logging.info(f"CSRF token extracted: {self.csrf_token[:10]}...")
-                            return self.csrf_token
-                
-                # Try to find token in JavaScript
-                js_pattern = re.compile(r'csrfToken["\s]*[:=]["\s]*["\'](.*?)["\']', re.IGNORECASE)
-                match = js_pattern.search(r.text)
-                if match:
-                    self.csrf_token = match.group(1)
-                    logging.info(f"CSRF token extracted from JS: {self.csrf_token[:10]}...")
-                    return self.csrf_token
-                
-                logging.warning("Could not find CSRF token in login page")
-            else:
-                logging.warning(f"Failed to get login page, status code: {r.status_code}")
-            
-            return None
-            
-        except requests.RequestException as e:
-            raise CSRFTokenError(f"Failed to get login page: {e}")
     
     def _browser_login(self) -> Tuple[Dict[str, str], Optional[webdriver.Chrome]]:
         """
@@ -261,72 +133,95 @@ class Authenticator:
         Raises:
             AuthenticationError: If login fails
         """
-        logging.info("Attempting browser login")
+        self.logger.info("Attempting browser login")
         
-        # Initialize webdriver if needed
-        if self.driver is None:
-            try:
-                self.driver = self._create_driver()
-            except Exception as e:
-                raise AuthenticationError(f"Failed to create webdriver: {e}")
+        self._ensure_driver()
         
         try:
-            # Navigate to community page
-            self.driver.get(self.config.specific_list_url)
-            time.sleep(self.config.wait_page_load)
-            
-            # Click login button (try by visible text '로그인')
-            try:
-                login_button = self.driver.find_element(By.XPATH, "//button[contains(text(), '로그인') or contains(., '로그인')]")
-            except NoSuchElementException:
-                try:
-                    login_button = self.driver.find_element(By.XPATH, "//a[contains(text(), '로그인') or contains(., '로그인')]")
-                except NoSuchElementException:
-                    # Fallback to original CSS selector if still not found
-                    login_button = self.driver.find_element(By.CSS_SELECTOR,
-                        "button.inline-flex.items-center.justify-center.whitespace-nowrap.rounded-md.transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-1.focus-visible\\:ring-ring.disabled\\:pointer-events-none.disabled\\:opacity-50.hover\\:bg-accent.hover\\:text-accent-foreground.h-10\\.5.w-10\\.5.cursor-pointer.border-none.bg-transparent.bg-none.bg-auto.p-1.px-0.font-semibold.text-\\[\\#222222\\].no-underline.text-sm")
-            self.driver.execute_script("arguments[0].click();", login_button)
-            time.sleep(self.config.wait_page_load)
-            
-            # Fill login form
-            email_input = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder='이메일 또는 아이디']")
-            email_input.clear()
-            email_input.send_keys(self.config.login_id)
-            time.sleep(1)
-            
-            password_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
-            password_input.clear()
-            password_input.send_keys(self.config.login_pw)
-            time.sleep(1)
-            
-            # Submit login
-            submit_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-            self.driver.execute_script("arguments[0].click();", submit_button)
-            time.sleep(self.config.wait_after_login)
-            
-            # Verify login success
-            if not self._is_logged_in_browser():
-                raise AuthenticationError("Browser login verification failed")
+            self._navigate_to_login_page()
+            self._perform_login()
+            self._verify_login_success()
             
             # Navigate to community list page after successful login
             self.driver.get(self.config.specific_list_url)
             time.sleep(self.config.wait_page_load)
             
-            # Extract cookies and apply to session
-            cookies = self.driver.get_cookies()
-            headers = {"User-Agent": self.config.user_agent}
-            
-            for cookie in cookies:
-                self.session.cookies.set(cookie['name'], cookie['value'])
-                self.scraper.cookies.set(cookie['name'], cookie['value'])
-                
-            logging.info("Browser login successful and navigated to community list")
-            return headers, self.driver
+            return self._extract_session_headers(), self.driver
             
         except Exception as e:
-            logging.error(f"Browser login failed: {e}")
+            self.logger.error(f"Browser login failed: {e}")
             raise AuthenticationError(f"Browser login failed: {e}")
-    
+
+    def _ensure_driver(self) -> None:
+        """Initialize webdriver if needed"""
+        if self.driver is None:
+            try:
+                self.driver = self._create_driver()
+            except Exception as e:
+                raise AuthenticationError(f"Failed to create webdriver: {e}")
+
+    def _navigate_to_login_page(self) -> None:
+        """Navigate to the site and open the login modal/page"""
+        self.driver.get(self.config.specific_list_url)
+        time.sleep(self.config.wait_page_load)
+        
+        # Click login button
+        login_button = self._find_login_button()
+        self.driver.execute_script("arguments[0].click();", login_button)
+        time.sleep(self.config.wait_page_load)
+
+    def _find_login_button(self):
+        """Find the initial login button using multiple strategies"""
+        try:
+            return self.driver.find_element(By.XPATH, AuthSelectors.LOGIN_BUTTON_TEXT_XPATH)
+        except NoSuchElementException:
+            try:
+                return self.driver.find_element(By.XPATH, AuthSelectors.LOGIN_LINK_TEXT_XPATH)
+            except NoSuchElementException:
+                return self.driver.find_element(By.CSS_SELECTOR, AuthSelectors.LOGIN_BUTTON_CSS)
+
+    def _perform_login(self) -> None:
+        """Fill and submit the login form"""
+        # Fill email
+        email_input = self.driver.find_element(By.CSS_SELECTOR, AuthSelectors.EMAIL_INPUT)
+        email_input.clear()
+        email_input.send_keys(self.config.login_id)
+        time.sleep(1)
+        
+        # Fill password
+        password_input = self.driver.find_element(By.CSS_SELECTOR, AuthSelectors.PASSWORD_INPUT)
+        password_input.clear()
+        password_input.send_keys(self.config.login_pw)
+        time.sleep(1)
+        
+        # Submit
+        submit_button = self._find_submit_button()
+        self.driver.execute_script("arguments[0].click();", submit_button)
+        time.sleep(self.config.wait_after_login)
+
+    def _find_submit_button(self):
+        """Find the submit button"""
+        try:
+            return self.driver.find_element(By.XPATH, AuthSelectors.SUBMIT_BUTTON_XPATH)
+        except NoSuchElementException:
+            return self.driver.find_element(By.XPATH, AuthSelectors.SUBMIT_BUTTON_FALLBACK_XPATH)
+
+    def _verify_login_success(self) -> None:
+        """Verify that login was successful"""
+        if not self._is_logged_in_browser():
+            raise AuthenticationError("Browser login verification failed")
+        self.logger.info("Browser login successful")
+
+    def _extract_session_headers(self) -> Dict[str, str]:
+        """Extract cookies and create session headers"""
+        cookies = self.driver.get_cookies()
+        headers = {"User-Agent": self.config.user_agent}
+        
+        for cookie in cookies:
+            self.session.cookies.set(cookie['name'], cookie['value'])
+            
+        return headers
+
     def _is_logged_in_browser(self) -> bool:
         """
         Check if browser login was successful
@@ -340,10 +235,10 @@ class Authenticator:
             
             # Check for common login success indicators
             success_indicators = [
-                "로그아웃",  # "logout" in Korean
-                "마이페이지",  # "my page" in Korean
-                "프로필",  # "profile" in Korean
-                self.config.login_id.lower()  # Username visible
+                AuthIndicators.LOGOUT,
+                AuthIndicators.MY_PAGE,
+                AuthIndicators.PROFILE,
+                self.config.login_id.lower()
             ]
             
             for indicator in success_indicators:
@@ -352,13 +247,13 @@ class Authenticator:
             
             # Check URL for success indicators
             current_url = self.driver.current_url.lower()
-            if "mypage" in current_url or "dashboard" in current_url:
+            if AuthIndicators.URL_MYPAGE in current_url or AuthIndicators.URL_DASHBOARD in current_url:
                 return True
                 
             return False
             
         except Exception as e:
-            logging.error(f"Error checking login status: {e}")
+            self.logger.error(f"Error checking login status: {e}")
             return False
     
     def _needs_reauth(self) -> bool:
@@ -375,7 +270,7 @@ class Authenticator:
         # Check session age
         session_age = datetime.now() - self.last_auth_time
         if session_age.total_seconds() > self.session_timeout:
-            logging.info(f"Session expired after {session_age.total_seconds():.0f} seconds")
+            self.logger.info(f"Session expired after {session_age.total_seconds():.0f} seconds")
             return True
         
         return False
@@ -415,10 +310,9 @@ class Authenticator:
             try:
                 self.driver.quit()
             except Exception as e:
-                logging.error(f"Error closing webdriver: {e}")
+                self.logger.error(f"Error closing webdriver: {e}")
             finally:
                 self.driver = None
         
         # Clear session
         self.session.close()
-        self.scraper.close()
