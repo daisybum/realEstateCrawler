@@ -34,8 +34,12 @@ class CrawlerError(Exception):
 class CrawlerSelectors:
     """CSS/XPath selectors for crawler"""
     POST_LINK = "a[href^='/community/']"
-    TITLE_MAIN = '.post-title, .view-title, h1.title, .board-title'
+    TITLE_MAIN = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.flex.justify-between.px-8.pt-8 > div > h1",
+        '.post-title', '.view-title', 'h1.title', '.board-title'
+    ]
     CONTENT_AREAS = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div",
         r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section",
         ".post-content", ".view-content", ".content", "article", ".fr-view", ".fr-element",
         "#post-content", "#view-content", "#content", ".viewer_content", ".board-content"
@@ -226,21 +230,30 @@ class Crawler:
             # 1. Check for downloads FIRST
             download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
             
-            # Also check content for file references
+            # Extract content (needed for both download check and saving)
+            content = ""
             try:
                 content = self._extract_content()
                 content_download_info = self.download_detector.check_content_for_file_references(content, post_id)
                 if content_download_info.has_download:
                     download_info.has_download = True
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"Error extracting content: {e}")
 
             if download_info.has_download:
                 self.logger.info(f"Skipping post {post_id} because it has downloads.")
                 return {'id': post_id, 'skipped': True, 'reason': 'has_downloads'}
             
-            # 2. If no downloads, extract and save images
-            self.logger.info(f"No downloads found for {post_id}. Checking for images...")
+            # 2. If no downloads, save text and extract images
+            self.logger.info(f"No downloads found for {post_id}. Processing content...")
+            
+            # Extract title
+            title = self._extract_title()
+            
+            # Save text content
+            self._save_post_text(post_id, title, content)
+            
+            # Extract and save images
             self._extract_and_save_images(post_id, session)
             
             return {'id': post_id, 'skipped': False, 'processed': True}
@@ -270,9 +283,14 @@ class Crawler:
         """Extract post title"""
         try:
             # Try specific elements first
-            title_elements = self.driver.find_elements(By.CSS_SELECTOR, CrawlerSelectors.TITLE_MAIN)
-            if title_elements:
-                return title_elements[0].text.strip()
+            for selector in CrawlerSelectors.TITLE_MAIN:
+                try:
+                    title_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if title_elements:
+                        return title_elements[0].text.strip()
+                except Exception:
+                    continue
+                    
             # Fallback to page title
             return self.driver.title.replace(' : 월급쟁이부자들', '').strip()
         except Exception as e:
@@ -280,30 +298,18 @@ class Crawler:
             return ""
 
     def _extract_content(self) -> str:
-        """Extract post content using multiple strategies"""
-        # Strategy 1: Known selectors
-        for selector in CrawlerSelectors.CONTENT_AREAS:
-            try:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                for element in elements:
-                    text = element.text.strip()
-                    if text and len(text) > 50:
-                        self.logger.info(f"Found content using selector: {selector} ({len(text)} chars)")
-                        return text
-            except Exception:
-                continue
-        
-        # Strategy 2: Body text heuristic
+        """Extract post content using specific selector"""
+        # Only use the first selector as requested by user
+        selector = CrawlerSelectors.CONTENT_AREAS[0]
         try:
-            return self._extract_content_from_body()
+            elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            if elements:
+                text = elements[0].text.strip()
+                if text:
+                    self.logger.info(f"Found content using selector: {selector} ({len(text)} chars)")
+                    return text
         except Exception as e:
-            self.logger.warning(f"Error extracting body text: {e}")
-            
-        # Strategy 3: BeautifulSoup fallback
-        try:
-            return self._extract_content_bs4()
-        except Exception as e:
-            self.logger.warning(f"BeautifulSoup parsing error: {e}")
+            self.logger.warning(f"Error extracting content with specific selector: {e}")
             
         return ""
 
@@ -398,6 +404,21 @@ class Crawler:
             self.logger.debug(f"Error detecting downloads: {e}")
             
         return attachments
+
+    def _save_post_text(self, post_id: str, title: str, content: str) -> None:
+        """Save post title and content to a text file"""
+        try:
+            output_dir = Path("output") / post_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            filepath = output_dir / f"{post_id}.txt"
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"Title: {title}\n\n")
+                f.write(content)
+                
+            self.logger.info(f"Saved text content to {filepath}")
+        except Exception as e:
+            self.logger.error(f"Error saving text content: {e}")
 
     def _extract_and_save_images(self, post_id: str, session: requests.Session) -> None:
         """Extract images and save them to output/<post_id>/"""
