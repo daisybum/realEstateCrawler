@@ -12,6 +12,7 @@ lxml-html-clean==0.4.2
 tqdm==4.67.1
 fake-useragent==2.2.0
 psutil==7.0.0
+python-dotenv==1.0.1
 
 # Image processing
 opencv-python==4.11.0.86
