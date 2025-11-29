@@ -227,3 +227,7 @@ checkpoint.json
 scripts/task-complexity-report.json
 tasks/ 
 data/
+
+# Agentic AI
+.agent/
+.agentconfig
