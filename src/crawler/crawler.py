@@ -241,8 +241,9 @@ class Crawler:
                 self.logger.warning(f"Error extracting content: {e}")
 
             if download_info.has_download:
-                self.logger.info(f"Skipping post {post_id} because it has downloads.")
-                return {'id': post_id, 'skipped': True, 'reason': 'has_downloads'}
+                self.logger.info(f"Downloads found for {post_id}. Downloading files...")
+                self._download_files(post_id, download_info, session)
+                return {'id': post_id, 'skipped': False, 'processed': True, 'has_downloads': True}
             
             # 2. If no downloads, save text and extract images
             self.logger.info(f"No downloads found for {post_id}. Processing content...")
@@ -404,6 +405,57 @@ class Crawler:
             self.logger.debug(f"Error detecting downloads: {e}")
             
         return attachments
+
+    def _download_files(self, post_id: str, download_info: Any, session: requests.Session) -> None:
+        """Download files to output/<post_id>/"""
+        try:
+            output_dir = Path("output") / post_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Sync cookies for downloading
+            self._sync_cookies_to_session(session)
+            
+            # 1. Download from detected links (CDN, etc.)
+            for link in download_info.download_links:
+                try:
+                    url = link.get('url')
+                    if not url:
+                        continue
+                        
+                    # Normalize URL
+                    full_url = url if url.startswith('http') else f"{self.config.base_url}{url}"
+                    
+                    # Determine filename
+                    filename = link.get('text')
+                    if not filename or filename == '다운로드':
+                        filename = full_url.split('/')[-1]
+                    
+                    # Clean filename
+                    filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+                    
+                    filepath = output_dir / filename
+                    self.logger.info(f"Downloading file {full_url} to {filepath}")
+                    
+                    response = session.get(full_url, stream=True, timeout=30)
+                    if response.status_code == 200:
+                        with open(filepath, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                    else:
+                        self.logger.warning(f"Failed to download file {full_url}: Status {response.status_code}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error downloading file {url}: {e}")
+                    
+            # 2. Handle specific download buttons if needed (though DownloadDetector usually extracts links)
+            # If DownloadDetector found buttons but no links, we might need to click them.
+            # However, we previously disabled clicking to prevent browser downloads.
+            # If we need to support button-triggered downloads that don't expose a link, 
+            # we would need to re-enable clicking but direct it to the specific folder.
+            # For now, we assume DownloadDetector extracts the direct links.
+            
+        except Exception as e:
+            self.logger.error(f"Error in _download_files: {e}")
 
     def _save_post_text(self, post_id: str, title: str, content: str) -> None:
         """Save post title and content to a text file"""
