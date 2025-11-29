@@ -45,6 +45,10 @@ class CrawlerSelectors:
         "#post-content", "#view-content", "#content", ".viewer_content", ".board-content"
     ]
     AUTHOR = '.author, .writer, .user-info'
+    AUTHOR_POST_COUNT = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > aside > div.sticky.top-\[90px\].w-\[383px\] > div > div > div > div:nth-child(2) > div > a:nth-child(2) > span.text-center.font-semibold.text-nowrap",
+        "/html/body/div[3]/div[3]/div[2]/aside/div[1]/div/div/div/div[2]/div/a[2]/span[2]"
+    ]
     DATE = '.date, .created-at, .post-date, .write-date, li[title]'
     IMAGES = [
         r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section img",
@@ -227,7 +231,29 @@ class Crawler:
             self.logger.info(f"Navigating to post: {url}")
             self._navigate_to_post(url, post_id)
             
-            # 1. Check for downloads FIRST
+            # 0. Check author's post count FIRST
+            try:
+                post_count_selector = CrawlerSelectors.AUTHOR_POST_COUNT[0]
+                post_count_element = self.driver.find_elements(By.CSS_SELECTOR, post_count_selector)
+                
+                if post_count_element:
+                    count_text = post_count_element[0].text.strip().replace(',', '')
+                    # Extract number from text (e.g. "1,234" -> 1234)
+                    count_match = re.search(r'\d+', count_text)
+                    if count_match:
+                        count = int(count_match.group())
+                        if count < 100:
+                            self.logger.info(f"Skipping post {post_id} because author has only {count} posts (< 100).")
+                            return {'id': post_id, 'skipped': True, 'reason': 'low_post_count'}
+                        else:
+                            self.logger.info(f"Author has {count} posts. Proceeding.")
+                else:
+                    self.logger.warning(f"Could not find post count element for {post_id}")
+                    
+            except Exception as e:
+                self.logger.warning(f"Error checking post count: {e}")
+
+            # 1. Check for downloads
             download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
             
             # Extract content (needed for both download check and saving)
@@ -335,19 +361,7 @@ class Crawler:
             return '\n'.join(content_lines)
         return ""
 
-    def _extract_content_bs4(self) -> str:
-        """Extract content using BeautifulSoup as fallback"""
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-        
-        for div in soup.find_all("div", class_=True):
-            class_name = div.get("class", [])
-            if class_name:
-                class_str = " ".join(class_name)
-                text = div.get_text(strip=True)
-                if text and len(text) > 100 and any(x in class_str.lower() for x in ["content", "post", "view"]):
-                    return text
-        return ""
+
 
     def _extract_metadata(self) -> Tuple[str, str]:
         """Extract author and creation date"""
