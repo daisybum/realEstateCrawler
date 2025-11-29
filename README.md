@@ -39,7 +39,7 @@
   - **BeautifulSoup4**: For HTML parsing.
   - **OpenCV & PaddleOCR**: For potential image processing/OCR tasks.
 - **Infrastructure**:
-  - Chrome WebDriver (Managed via `webdriver-manager`)
+  - System-installed Chromium & ChromeDriver (Snap) - Optimized for aarch64
   - Local File System for storage (`output/` directory)
 
 #### 2.2 Target URL
@@ -276,7 +276,7 @@ graph TD;
   - **BeautifulSoup4**: HTML 파싱.
   - **OpenCV & PaddleOCR**: 이미지 처리/OCR 작업(필요 시).
 - **인프라**:
-  - Chrome WebDriver (`webdriver-manager`로 관리)
+  - 시스템 설치 Chromium & ChromeDriver (Snap) - aarch64 최적화
   - 로컬 파일 시스템 스토리지 (`output/` 디렉토리)
 
 #### 2.2 타겟 URL
