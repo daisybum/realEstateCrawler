@@ -18,7 +18,6 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import WebDriverException, NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 from src.config import Config
 
@@ -283,11 +282,9 @@ class Authenticator:
             Configured Chrome webdriver
         """
         options = Options()
-        options.headless = self.config.browser_options["headless"]
-        # Enable performance logging for Network events
-        perf_prefs = {"performance": "ALL"}
-        options.set_capability('goog:loggingPrefs', perf_prefs)
-        
+        if self.config.browser_options["headless"]:
+            options.add_argument("--headless=new")
+            
         if self.config.browser_options["disable_automation"]:
             options.add_argument("--disable-blink-features=AutomationControlled")
         
@@ -297,10 +294,25 @@ class Authenticator:
         if self.config.browser_options["disable_shm"]:
             options.add_argument("--disable-dev-shm-usage")
             
+        options.add_argument("--disable-gpu")
+        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument("--window-size=1920,1080")
+            
         options.add_argument(f'user-agent={self.config.user_agent}')
         
+        # Set binary location if configured
+        if self.config.browser_options.get("binary_location"):
+            options.binary_location = self.config.browser_options["binary_location"]
+            
+        # Get driver path from config
+        driver_path = self.config.browser_options.get("driver_path")
+        if not driver_path:
+            raise AuthenticationError("ChromeDriver path not configured")
+            
+        service = Service(executable_path=driver_path)
+        
         return webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
+            service=service,
             options=options
         )
     

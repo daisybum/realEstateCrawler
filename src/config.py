@@ -62,6 +62,8 @@ class ConfigLoader:
             'disable_automation': True,
             'no_sandbox': True,
             'disable_shm': True,
+            'chrome_binary_path': '/snap/bin/chromium',
+            'chromedriver_path': '/snap/chromium/3312/usr/lib/chromium-browser/chromedriver',
             
             # Request/Timeout Settings
             'request_timeout': 20,  # seconds
@@ -127,6 +129,8 @@ class ConfigLoader:
             'WEOLBU_LOGIN_PW': 'login_pw',
             'WEOLBU_USER_AGENT': 'user_agent',
             'WEOLBU_BROWSER_HEADLESS': 'browser_headless',
+            'WEOLBU_CHROME_BINARY_PATH': 'chrome_binary_path',
+            'WEOLBU_CHROMEDRIVER_PATH': 'chromedriver_path',
             'WEOLBU_REQUEST_TIMEOUT': 'request_timeout',
             'WEOLBU_WAIT_AFTER_LOGIN': 'wait_after_login',
             'WEOLBU_WAIT_PAGE_LOAD': 'wait_page_load',
@@ -239,7 +243,9 @@ class Config:
             "headless": config['browser_headless'],
             "disable_automation": config['disable_automation'],
             "no_sandbox": config['no_sandbox'],
-            "disable_shm": config['disable_shm']
+            "disable_shm": config['disable_shm'],
+            "binary_location": config['chrome_binary_path'],
+            "driver_path": config['chromedriver_path']
         }
         
         # Request/Timeout Settings
