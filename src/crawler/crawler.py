@@ -406,53 +406,50 @@ class Crawler:
             
         return attachments
 
+    def _set_download_behavior(self, download_path: str) -> None:
+        """Set download behavior using CDP"""
+        try:
+            params = {
+                "behavior": "allow",
+                "downloadPath": str(Path(download_path).absolute())
+            }
+            self.driver.execute_cdp_cmd("Page.setDownloadBehavior", params)
+            self.logger.info(f"Set download path to: {download_path}")
+        except Exception as e:
+            self.logger.error(f"Error setting download behavior: {e}")
+
     def _download_files(self, post_id: str, download_info: Any, session: requests.Session) -> None:
-        """Download files to output/<post_id>/"""
+        """Download files by clicking buttons"""
         try:
             output_dir = Path("output") / post_id
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Sync cookies for downloading
-            self._sync_cookies_to_session(session)
+            # Set download path dynamically
+            self._set_download_behavior(str(output_dir))
             
-            # 1. Download from detected links (CDN, etc.)
-            for link in download_info.download_links:
+            # Find and click download buttons
+            user_selector = r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.space-y-6.px-8.py-10 > ul > li > div > div.text-primary-600.flex.items-center.space-x-1\.5.py-2\.5 > span"
+            
+            buttons = self.driver.find_elements(By.CSS_SELECTOR, user_selector)
+            if not buttons:
+                self.logger.warning(f"No download buttons found for {post_id} despite detection.")
+                return
+
+            for i, btn in enumerate(buttons):
                 try:
-                    url = link.get('url')
-                    if not url:
-                        continue
-                        
-                    # Normalize URL
-                    full_url = url if url.startswith('http') else f"{self.config.base_url}{url}"
+                    self.logger.info(f"Clicking download button {i+1}...")
+                    # Scroll into view and click
+                    self.driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+                    time.sleep(0.5)
+                    self.driver.execute_script("arguments[0].click();", btn)
                     
-                    # Determine filename
-                    filename = link.get('text')
-                    if not filename or filename == '다운로드':
-                        filename = full_url.split('/')[-1]
-                    
-                    # Clean filename
-                    filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-                    
-                    filepath = output_dir / filename
-                    self.logger.info(f"Downloading file {full_url} to {filepath}")
-                    
-                    response = session.get(full_url, stream=True, timeout=30)
-                    if response.status_code == 200:
-                        with open(filepath, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                    else:
-                        self.logger.warning(f"Failed to download file {full_url}: Status {response.status_code}")
-                        
+                    # Wait for download to start/finish
+                    time.sleep(3) 
                 except Exception as e:
-                    self.logger.error(f"Error downloading file {url}: {e}")
-                    
-            # 2. Handle specific download buttons if needed (though DownloadDetector usually extracts links)
-            # If DownloadDetector found buttons but no links, we might need to click them.
-            # However, we previously disabled clicking to prevent browser downloads.
-            # If we need to support button-triggered downloads that don't expose a link, 
-            # we would need to re-enable clicking but direct it to the specific folder.
-            # For now, we assume DownloadDetector extracts the direct links.
+                    self.logger.error(f"Error clicking button {i+1}: {e}")
+            
+            # Wait a bit more for downloads to complete
+            time.sleep(2)
             
         except Exception as e:
             self.logger.error(f"Error in _download_files: {e}")

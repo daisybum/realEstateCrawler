@@ -283,6 +283,16 @@ class DownloadDetector:
         result = DownloadInfo()
         
         try:
+            # 0. User provided specific selector
+            user_selector = r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.space-y-6.px-8.py-10 > ul > li > div > div.text-primary-600.flex.items-center.space-x-1\.5.py-2\.5 > span"
+            try:
+                user_buttons = driver.find_elements(By.CSS_SELECTOR, user_selector)
+                if user_buttons:
+                    logging.info(f"[페이지 {pid}] 사용자 지정 다운로드 버튼 발견")
+                    result.has_download = True
+            except Exception as e:
+                logging.debug(f"Error checking user selector: {e}")
+
             # 1. 가장 먼저 특정 다운로드 버튼 찾기 (<span class="text-sm font-semibold">다운로드</span>)
             specific_download_spans = driver.find_elements(By.XPATH, "//span[@class='text-sm font-semibold' and contains(text(), '다운로드')]")
             if specific_download_spans:
