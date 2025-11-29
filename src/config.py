@@ -267,5 +267,5 @@ class Config:
     def ensure_directories():
         """Ensure all necessary directories exist"""
         config = Config.get_instance()
-        for path in [config.output_dir, config.download_dir]:
+        for path in [config.output_dir]:
             os.makedirs(path, exist_ok=True)

@@ -23,7 +23,6 @@ from tqdm import tqdm
 from src.config import Config
 from src.crawler.auth import Authenticator
 from src.crawler.download_detector import DownloadDetector
-from src.storage.file_processor import FileProcessor
 from src.storage.storage import CheckpointManager
 
 
@@ -37,12 +36,17 @@ class CrawlerSelectors:
     POST_LINK = "a[href^='/community/']"
     TITLE_MAIN = '.post-title, .view-title, h1.title, .board-title'
     CONTENT_AREAS = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section",
         ".post-content", ".view-content", ".content", "article", ".fr-view", ".fr-element",
         "#post-content", "#view-content", "#content", ".viewer_content", ".board-content"
     ]
     AUTHOR = '.author, .writer, .user-info'
     DATE = '.date, .created-at, .post-date, .write-date, li[title]'
-    IMAGES = [".post-content img", ".view-content img", ".content img", "article img", ".fr-view img"]
+    IMAGES = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section img",
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section > figure img",
+        ".post-content img", ".view-content img", ".content img", "article img", ".fr-view img"
+    ]
 
 
 class NoOpStorage:
@@ -81,6 +85,17 @@ class Crawler:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument(f'user-agent={self.config.user_agent}')
+        
+        # Configure download directory to /dev/null and block downloads
+        prefs = {
+            "download.default_directory": "/dev/null",
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": True,
+            "profile.default_content_settings.popups": 0,
+            "download_restrictions": 3  # 3 = Block all downloads
+        }
+        options.add_experimental_option("prefs", prefs)
         
         if self.config.browser_options.get("headless"):
             options.add_argument("--headless")
@@ -195,7 +210,7 @@ class Crawler:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
     
-    def _process_post(self, url: str) -> Dict[str, Any]:
+    def _process_post(self, url: str, session: requests.Session) -> Dict[str, Any]:
         """Process a single post by its URL"""
         try:
             post_id = url.split('/')[-1]
@@ -208,39 +223,27 @@ class Crawler:
             self.logger.info(f"Navigating to post: {url}")
             self._navigate_to_post(url, post_id)
             
-            # Initialize post data
-            post_data = {
-                'id': post_id,
-                'url': url,
-                'title': '',
-                'content': '',
-                'author': '',
-                'created_at': '',
-                'attachments': [],
-                'date_limit_reached': False
-            }
+            # 1. Check for downloads FIRST
+            download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
             
-            # Extract data
-            post_data['title'] = self._extract_title()
-            post_data['content'] = self._extract_content()
+            # Also check content for file references
+            try:
+                content = self._extract_content()
+                content_download_info = self.download_detector.check_content_for_file_references(content, post_id)
+                if content_download_info.has_download:
+                    download_info.has_download = True
+            except Exception:
+                pass
+
+            if download_info.has_download:
+                self.logger.info(f"Skipping post {post_id} because it has downloads.")
+                return {'id': post_id, 'skipped': True, 'reason': 'has_downloads'}
             
-            author, created_at = self._extract_metadata()
-            post_data['author'] = author
-            post_data['created_at'] = created_at
+            # 2. If no downloads, extract and save images
+            self.logger.info(f"No downloads found for {post_id}. Checking for images...")
+            self._extract_and_save_images(post_id, session)
             
-            # Detect downloads
-            post_data['attachments'] = self._detect_downloads(url, post_id, post_data['content'])
-            
-            # Extract images (append to content)
-            image_text = self._extract_images()
-            if image_text:
-                post_data['content'] += f"\n\n{image_text}"
-            
-            # Check date limit
-            if created_at and re.match(r"^\d{2}\.\d{2}\.\d{2}$", created_at.strip()):
-                post_data['date_limit_reached'] = True
-                
-            return post_data
+            return {'id': post_id, 'skipped': False, 'processed': True}
             
         except Exception as e:
             self.logger.error(f"Error processing post {url}: {e}")
@@ -396,30 +399,97 @@ class Crawler:
             
         return attachments
 
-    def _extract_images(self) -> str:
-        """Extract images and return formatted string"""
-        image_text = ""
+    def _extract_and_save_images(self, post_id: str, session: requests.Session) -> None:
+        """Extract images and save them to output/<post_id>/"""
         try:
-            for selector in CrawlerSelectors.IMAGES:
-                images = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                for img in images:
-                    src = img.get_attribute("src")
-                    if src and not src.startswith("data:") and not src.endswith(".svg"):
-                        img_url = src if src.startswith("http") else f"{self.config.base_url}{src}"
-                        if img_url:
-                            image_text += f"[이미지: {img_url}]\n"
+            image_urls = [] # Use list to preserve order
+            seen_urls = set()
+            
+            # Strategy 1: Find images within the content area (preserves document order)
+            found_in_content = False
+            for selector in CrawlerSelectors.CONTENT_AREAS:
+                try:
+                    content_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if content_elements:
+                        # Use the first matching content area
+                        container = content_elements[0]
+                        images = container.find_elements(By.TAG_NAME, "img")
+                        if images:
+                            self.logger.info(f"Found {len(images)} images in content area: {selector}")
+                            for img in images:
+                                src = img.get_attribute("src")
+                                if src and not src.startswith("data:") and not src.endswith(".svg"):
+                                    img_url = src if src.startswith("http") else f"{self.config.base_url}{src}"
+                                    if img_url not in seen_urls:
+                                        image_urls.append(img_url)
+                                        seen_urls.add(img_url)
+                            found_in_content = True
+                            break
+                except Exception:
+                    continue
+            
+            # Strategy 2: Fallback to IMAGES selectors if no images found in content area
+            if not found_in_content:
+                for selector in CrawlerSelectors.IMAGES:
+                    images = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for img in images:
+                        src = img.get_attribute("src")
+                        if src and not src.startswith("data:") and not src.endswith(".svg"):
+                            img_url = src if src.startswith("http") else f"{self.config.base_url}{src}"
+                            if img_url not in seen_urls:
+                                image_urls.append(img_url)
+                                seen_urls.add(img_url)
+            
+            if not image_urls:
+                self.logger.info(f"No images found for post {post_id}")
+                return
+
+            self.logger.info(f"Found {len(image_urls)} images for post {post_id}")
+            
+            # Sync cookies for downloading
+            self._sync_cookies_to_session(session)
+            
+            # Create output directory for this post
+            output_dir = Path("output") / post_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Download images
+            for i, img_url in enumerate(image_urls):
+                try:
+                    # Determine extension
+                    ext = "jpg"
+                    if "." in img_url.split("/")[-1]:
+                        possible_ext = img_url.split("/")[-1].split(".")[-1].split("?")[0]
+                        if possible_ext.lower() in ["png", "jpeg", "jpg", "gif", "webp"]:
+                            ext = possible_ext
+                    
+                    filename = f"image_{i+1}.{ext}"
+                    filepath = output_dir / filename
+                    
+                    self.logger.info(f"Downloading image {img_url} to {filepath}")
+                    
+                    # Use session for download
+                    response = session.get(img_url, stream=True, timeout=10)
+                        
+                    if response.status_code == 200:
+                        with open(filepath, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                    else:
+                        self.logger.warning(f"Failed to download image {img_url}: Status {response.status_code}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error downloading image {img_url}: {e}")
+                    
         except Exception as e:
-            self.logger.debug(f"Error extracting images: {e}")
-        return image_text.strip()
+            self.logger.error(f"Error extracting/saving images: {e}")
 
     def _save_results(self, results: List[Dict[str, Any]]) -> None:
-        """Save results to JSONL file with consistent format"""
-        output_file = Path(self.config.out_jsonl)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_file, 'a', encoding='utf-8') as f:
-            for result in results:
-                f.write(json.dumps(self._format_result_for_save(result), ensure_ascii=False) + '\n')
+        """
+        Save results to JSONL file.
+        DISABLED for Image Crawler Mode as per user request.
+        """
+        pass
 
     def _format_result_for_save(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Format a single result for saving"""
@@ -471,9 +541,6 @@ class Crawler:
             'errors': 0
         }
         
-        # Use authenticator session (with cookies) for HTTP downloads
-        file_processor = FileProcessor(scraper=self.authenticator.session, download_dir=self.config.download_dir)
-        
         try:
             self.ensure_authenticated()
             start_page = start_page or 1
@@ -494,7 +561,7 @@ class Crawler:
                         self.logger.info(f"No more posts found on page {page}")
                         break
                     
-                    self._process_page_posts(posts, page, stats, file_processor)
+                    self._process_page_posts(posts, page, stats, self.authenticator.session)
                     
                     # Save checkpoint
                     self.checkpoint_manager.save(page, f"Processed page {page}")
@@ -523,21 +590,18 @@ class Crawler:
         finally:
             self.close()
 
-    def _process_page_posts(self, posts: List[Tuple[str, str]], page: int, stats: Dict[str, Any], file_processor: FileProcessor) -> None:
+    def _process_page_posts(self, posts: List[Tuple[str, str]], page: int, stats: Dict[str, Any], session: requests.Session) -> None:
         """Process all posts on a single page"""
         for title, url in tqdm(posts, desc=f"Posts p{page}", leave=False):
             try:
                 self.logger.info(f"Processing post: {title}")
-                post_data = self._process_post(url)
+                # Pass session to _process_post
+                result = self._process_post(url, session)
                 
-                if post_data.get('date_limit_reached'):
-                    raise StopIteration("Date limit reached")
-                
-                result = self._create_result_record(post_data, title, url)
-                self._handle_downloads(result, post_data, file_processor, stats)
-                
-                self._save_results([{'data': result, 'url': url}])
-                stats['posts_processed'] += 1
+                if result.get('skipped'):
+                    stats['posts_skipped'] = stats.get('posts_skipped', 0) + 1
+                else:
+                    stats['posts_processed'] += 1
                 
             except StopIteration:
                 raise
@@ -559,49 +623,11 @@ class Crawler:
             'file_formats': []
         }
 
-    def _handle_downloads(self, result: Dict[str, Any], post_data: Dict[str, Any], file_processor: FileProcessor, stats: Dict[str, Any]) -> None:
-        """Handle file downloads for a post"""
-        if not post_data.get('attachments'):
-            return
-
-        self._sync_cookies_to_session(file_processor)
-        
-        file_formats = set()
-        file_sources = []
-        
-        for attachment in post_data['attachments']:
-            attachment_url = attachment.get('url', '')
-            if not attachment_url:
-                continue
-                
-            if '.' in attachment_url:
-                fmt = attachment_url.split('.')[-1].lower()
-                if fmt in ['pdf', 'pptx', 'docx', 'xlsx']:
-                    file_formats.add(fmt)
-            
-            try:
-                downloaded_file = file_processor.download_file(
-                    url=attachment_url,
-                    post_id=post_data.get('id'),
-                    filename=attachment.get('filename', '')
-                )
-                if downloaded_file:
-                    file_sources.append(attachment_url)
-            except Exception as e:
-                self.logger.error(f"Error downloading file {attachment_url}: {e}")
-                stats['errors'] += 1
-        
-        if file_formats:
-            result['has_download'] = True
-            result['file_formats'] = list(file_formats)
-            stats['posts_with_downloads'] += 1
-            stats['files_processed'] += len(file_sources)
-
-    def _sync_cookies_to_session(self, file_processor: FileProcessor) -> None:
-        """Sync Selenium cookies to the file processor's session"""
+    def _sync_cookies_to_session(self, session: requests.Session) -> None:
+        """Sync Selenium cookies to the requests session"""
         try:
-            if self.driver and hasattr(file_processor, 'scraper') and file_processor.scraper:
+            if self.driver and session:
                 for cookie in self.driver.get_cookies():
-                    file_processor.scraper.cookies.set(cookie['name'], cookie['value'])
+                    session.cookies.set(cookie['name'], cookie['value'])
         except Exception:
             pass
