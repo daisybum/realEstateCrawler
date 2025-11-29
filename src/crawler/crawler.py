@@ -49,6 +49,10 @@ class CrawlerSelectors:
         r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > aside > div.sticky.top-\[90px\].w-\[383px\] > div > div > div > div:nth-child(2) > div > a:nth-child(2) > span.text-center.font-semibold.text-nowrap",
         "/html/body/div[3]/div[3]/div[2]/aside/div[1]/div/div/div/div[2]/div/a[2]/span[2]"
     ]
+    VIP_SIDEBAR = [
+        r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > aside",
+        "/html/body/div[3]/div[3]/div[2]/aside"
+    ]
     DATE = '.date, .created-at, .post-date, .write-date, li[title]'
     IMAGES = [
         r"body > div.min-w-\[1200px\].max-w-\[2560px\].mx-auto.isolate > div.bg-\[\#f2f2f2\].pt-4.pb-20 > div.flex.mx-auto.max-w-\[1200px\].px-2\.5 > div > section:nth-child(1) > div.relative.overflow-hidden > section > div > div > section img",
@@ -231,57 +235,85 @@ class Crawler:
             self.logger.info(f"Navigating to post: {url}")
             self._navigate_to_post(url, post_id)
             
-            # 0. Check author's post count FIRST
+            # --- 0. Check VIP Status & Post Count ---
+            is_vip = False
+            post_count = None
+            
+            # Check VIP (Creator/Ace in sidebar)
+            try:
+                vip_selector = CrawlerSelectors.VIP_SIDEBAR[0]
+                sidebar_elements = self.driver.find_elements(By.CSS_SELECTOR, vip_selector)
+                if sidebar_elements:
+                    sidebar_text = sidebar_elements[0].text
+                    if '크리에이터' in sidebar_text or '에이스' in sidebar_text:
+                        is_vip = True
+                        self.logger.info(f"VIP Author detected for post {post_id}")
+            except Exception as e:
+                self.logger.warning(f"Error checking VIP status: {e}")
+
+            # Check Post Count
             try:
                 post_count_selector = CrawlerSelectors.AUTHOR_POST_COUNT[0]
                 post_count_element = self.driver.find_elements(By.CSS_SELECTOR, post_count_selector)
                 
                 if post_count_element:
                     count_text = post_count_element[0].text.strip().replace(',', '')
-                    # Extract number from text (e.g. "1,234" -> 1234)
                     count_match = re.search(r'\d+', count_text)
                     if count_match:
-                        count = int(count_match.group())
-                        if count < 100:
-                            self.logger.info(f"Skipping post {post_id} because author has only {count} posts (< 100).")
-                            return {'id': post_id, 'skipped': True, 'reason': 'low_post_count'}
-                        else:
-                            self.logger.info(f"Author has {count} posts. Proceeding.")
-                else:
-                    self.logger.warning(f"Could not find post count element for {post_id}")
-                    
+                        post_count = int(count_match.group())
             except Exception as e:
                 self.logger.warning(f"Error checking post count: {e}")
 
-            # 1. Check for downloads
-            download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
+            # --- Skip Logic ---
+            # Skip ONLY if:
+            # 1. Not VIP
+            # 2. Post count was successfully found
+            # 3. Post count <= 100
+            if not is_vip and post_count is not None and post_count <= 100:
+                self.logger.info(f"Skipping post {post_id} because author has only {post_count} posts (<= 100) and is not VIP.")
+                return {'id': post_id, 'skipped': True, 'reason': 'low_post_count'}
             
-            # Extract content (needed for both download check and saving)
+            if is_vip:
+                self.logger.info(f"Processing post {post_id} (VIP Author).")
+            elif post_count is None:
+                self.logger.info(f"Processing post {post_id} (Post count not found).")
+            else:
+                self.logger.info(f"Processing post {post_id} (Author has {post_count} posts).")
+
+            # --- Processing (Unconditional) ---
+            
+            # 1. Extract Content & Title (Always)
             content = ""
+            title = ""
             try:
                 content = self._extract_content()
-                content_download_info = self.download_detector.check_content_for_file_references(content, post_id)
-                if content_download_info.has_download:
-                    download_info.has_download = True
+                title = self._extract_title()
+                # Save text content
+                self._save_post_text(post_id, title, content)
             except Exception as e:
-                self.logger.warning(f"Error extracting content: {e}")
+                self.logger.warning(f"Error extracting/saving content: {e}")
 
-            if download_info.has_download:
-                self.logger.info(f"Downloads found for {post_id}. Downloading files...")
-                self._download_files(post_id, download_info, session)
-                return {'id': post_id, 'skipped': False, 'processed': True, 'has_downloads': True}
-            
-            # 2. If no downloads, save text and extract images
-            self.logger.info(f"No downloads found for {post_id}. Processing content...")
-            
-            # Extract title
-            title = self._extract_title()
-            
-            # Save text content
-            self._save_post_text(post_id, title, content)
-            
-            # Extract and save images
-            self._extract_and_save_images(post_id, session)
+            # 2. Extract & Save Images (Always)
+            try:
+                self._extract_and_save_images(post_id, session)
+            except Exception as e:
+                self.logger.warning(f"Error extracting images: {e}")
+
+            # 3. Check & Download Files (If present)
+            try:
+                download_info = self.download_detector.check_for_downloads_browser(self.driver, url, post_id)
+                
+                # Check content for file references too
+                if content:
+                    content_download_info = self.download_detector.check_content_for_file_references(content, post_id)
+                    if content_download_info.has_download:
+                        download_info.has_download = True
+                
+                if download_info.has_download:
+                    self.logger.info(f"Downloads found for {post_id}. Downloading files...")
+                    self._download_files(post_id, download_info, session)
+            except Exception as e:
+                self.logger.warning(f"Error handling downloads: {e}")
             
             return {'id': post_id, 'skipped': False, 'processed': True}
             
