@@ -268,9 +268,9 @@ class Crawler:
             # Skip ONLY if:
             # 1. Not VIP
             # 2. Post count was successfully found
-            # 3. Post count <= 100
-            if not is_vip and post_count is not None and post_count <= 100:
-                self.logger.info(f"Skipping post {post_id} because author has only {post_count} posts (<= 100) and is not VIP.")
+            # 3. Post count < 100
+            if not is_vip and post_count is not None and post_count < 100:
+                self.logger.info(f"Skipping post {post_id} because author has only {post_count} posts (< 100) and is not VIP.")
                 return {'id': post_id, 'skipped': True, 'reason': 'low_post_count'}
             
             if is_vip:
